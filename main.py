@@ -101,6 +101,10 @@ async def alltrend(request: Request):
     # startup_event는 앱 시작 시 한 번만 실행됨 (중복 실행 방지)
     return templates.TemplateResponse("alltrend.html", {"request": request, "markets": krw_markets})
 
+@app.get("/top30trend", response_class=HTMLResponse)
+async def t30trend(request: Request):
+    # 마켓 리스트는 필요하면 전달, 실제로는 JS에서 데이터 받아옴
+    return templates.TemplateResponse("top30trend.html", {"request": request, "markets": krw_markets})
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -146,4 +150,51 @@ async def websocket_endpoint(websocket: WebSocket):
     except asyncio.CancelledError:
         raise
     except Exception:
+        pass
+
+@app.websocket("/ws/top30trend")
+async def websocket_top30trend(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            result = []
+            for market in krw_markets:
+                market_data = trade_queues.get(market)
+                if not market_data:
+                    continue
+                bid10 = round(sum(list(market_data['BID'])[-10:]), 0)
+                ask10 = round(sum(list(market_data['ASK'])[-10:]), 0)
+                bid30 = round(sum(list(market_data['BID'])[-30:]), 0)
+                ask30 = round(sum(list(market_data['ASK'])[-30:]), 0)
+                bid120 = round(sum(list(market_data['BID'])[-120:]), 0)
+                ask120 = round(sum(list(market_data['ASK'])[-120:]), 0)
+                ratio10 = round((bid10/ask10)*100, 1) if ask10 > 0 else 0.0
+                ratio30 = round((bid30/ask30)*100, 1) if ask30 > 0 else 0.0
+                ratio120 = round((bid120/ask120)*100, 1) if ask120 > 0 else 0.0
+                speed = trade_counts.get(market, 0)
+                row = {
+                    "market": market,
+                    "speed": speed,
+                    "bid10": bid10,
+                    "ask10": ask10,
+                    "bid30": bid30,
+                    "ask30": ask30,
+                    "bid120": bid120,
+                    "ask120": ask120,
+                    "ratio10": ratio10,
+                    "ratio30": ratio30,
+                    "ratio120": ratio120,
+                }
+                # ratio30이 100을 넘는 것만 추가
+                if ratio30 > 100 and speed > 0:
+                    result.append(row)
+            # speed 내림차순 정렬
+            result.sort(key=lambda x: x['speed'], reverse=True)
+            top30 = result[:30]
+            await websocket.send_json({
+                "count": len(top30),
+                "coins": top30
+            })
+            await asyncio.sleep(1)
+    except WebSocketDisconnect:
         pass

@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Upbit 코인 실시간 상위 30</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- DataTables CSS -->
+    <link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css"/>
+</head>
+<body>
+<div class="container mt-5">
+    <h2 class="mb-4">Upbit 코인 실시간 체결금액 상위 30 모니터링</h2>
+    <table class="table table-striped table-bordered align-middle text-center" id="trade-table">
+        <thead class="table-light">
+            <tr style="text-align: center;">
+                <th class="text-center">코인명</th>
+                <th class="text-center">체결량</th>
+                <th class="text-center">매수(10)</th>
+                <th class="text-center">매도(10)</th>
+                <th class="text-center">매수(30)</th>
+                <th class="text-center">매도(30)</th>
+                <th class="text-center">매수(120)</th>
+                <th class="text-center">매도(120)</th>
+                <th class="text-center">RATE 10</th>
+                <th class="text-center">RATE 30</th>
+                <th class="text-center">RATE 120</th>
+            </tr>
+        </thead>
+        <tbody>
+        </tbody>
+    </table>
+</div>
+
+<!-- jQuery, DataTables JS -->
+<script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
+
+<script>
+    let ws = new WebSocket("ws://localhost:8000/ws/top30trend");
+
+    ws.onopen = function() {
+        console.log("WebSocket 연결됨");
+    };
+    ws.onerror = function(e) {
+        console.error("WebSocket 에러", e);
+    };
+
+    // DataTables 초기화
+    // DataTables 초기화
+    let table = $('#trade-table').DataTable({
+    "paging": true,
+    "searching": true,
+    "ordering": true,
+    "info": false,
+    "pageLength": 30,
+    "order": [[2, "desc"]],
+    "columnDefs": [
+        {
+        "targets": [0],
+        "className": "text-center",
+        "render": function(data, type, row) {
+            if (type === 'display') {
+                return `<a href="https://upbit.com/exchange?code=CRIX.UPBIT.${data}" target="_blank">${data}</a>`;
+            }
+            return data;
+        }
+        },
+        { "targets": [1], "className": "text-center" },
+        {
+            "targets": [2,4,6], // 매수금액
+            "render": function (data, type, row) {
+                if (type === 'display') {
+                    return `<span class="text-success">${parseInt(data).toLocaleString()}</span>`;
+                }
+                return data;
+            },
+            "type": "num",
+            "className": "text-end"
+        },
+        {
+            "targets": [3,5,7], // 매도금액
+            "render": function (data, type, row) {
+                if (type === 'display') {
+                    return `<span class="text-danger">${parseInt(data).toLocaleString()}</span>`;
+                }
+                return data;
+            },
+            "type": "num",
+            "className": "text-end"
+        },
+        {
+            "targets": [8,9,10], // 비율(%)
+            "render": function (data, type, row) {
+                if (type === 'display') {
+                    let color = (parseFloat(data) >= 100) ? 'text-success' : 'text-danger';
+                    return `<span class="${color}">${data}%</span>`;
+                }
+                return data;
+            },
+            "type": "num",
+            "className": "text-end"
+        }
+    ]
+});
+
+    ws.onmessage = function(event) {
+        let data = JSON.parse(event.data);
+        let coins = data.coins;
+        table.clear();
+        coins.forEach(row => {
+            table.row.add([
+                row.market,
+                row.speed,
+                row.bid10,
+                row.ask10,
+                row.bid30,
+                row.ask30,
+                row.bid120,
+                row.ask120,
+                row.ratio10,
+                row.ratio30,
+                row.ratio120
+            ]);
+        });
+        table.draw(false);
+    };
+
+</script>
+</body>
+</html>
