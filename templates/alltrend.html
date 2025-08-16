@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Upbit 전체 코인 실시간 체결금액 누적 모니터</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- DataTables CSS -->
+    <link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css"/>
+</head>
+<body>
+<div class="container mt-5">
+    <h2 class="mb-4">Upbit 코인 실시간 체결금액 모니터링</h2>
+    <table class="table table-striped table-bordered align-middle text-center" id="trade-table">
+        <thead class="table-light">
+            <tr style="text-align: center;">
+                <th class="text-center">코인명</th>
+                <th class="text-center">체결속도</th>
+                <th class="text-center">매수금액(10)</th>
+                <th class="text-center">매도금액(10)</th>
+                <th class="text-center">매수금액(30)</th>
+                <th class="text-center">매도금액(30)</th>
+                <th class="text-center">매수금액(120)</th>
+                <th class="text-center">매도금액(120)</th>
+                <th class="text-center">매수/매도(10) %</th>
+                <th class="text-center">매수/매도(30) %</th>
+                <th class="text-center">매수/매도(120) %</th>
+
+            </tr>
+        </thead>
+        <tbody>
+        {% for market in markets %}
+            <tr>
+                <td> {{ market }} </td>
+                <td id="{{ market }}-speed">0</td>
+                <td id="{{ market }}-BID-sum10">0</td>
+                <td id="{{ market }}-ASK-sum10">0</td>
+                <td id="{{ market }}-BID-sum30">0</td>
+                <td id="{{ market }}-ASK-sum30">0</td>
+                <td id="{{ market }}-BID-sum120">0</td>
+                <td id="{{ market }}-ASK-sum120">0</td>
+                <td id="{{ market }}-RATIO10">0</td>
+                <td id="{{ market }}-RATIO30">0</td>
+                <td id="{{ market }}-RATIO120">0</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<!-- jQuery, DataTables JS -->
+<script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
+
+<script>
+
+    let ws = new WebSocket("ws://localhost:8000/ws"); // 예시
+
+    ws.onopen = function() {
+        console.log("WebSocket 연결됨");
+    };
+    ws.onerror = function(e) {
+        console.error("WebSocket 에러", e);
+    };
+    // DataTables 초기화
+    let table = $('#trade-table').DataTable({
+    "paging": true,
+    "searching": true,
+    "ordering": true,
+    "info": false,
+    "pageLength": 30,
+    "order": [[2, "desc"]],
+    "columnDefs": [
+        {
+        "targets": [0],
+        "className": "text-center",
+        "render": function(data, type, row) {
+            if (type === 'display') {
+                // data: 코인명 (예: BTC-KRW)
+                return `<a href="https://upbit.com/exchange?code=CRIX.UPBIT.${data}" target="_blank">${data}</a>`;
+            }
+            return data;
+        }
+        },
+        { "targets": [1], "className": "text-center" },
+        {
+            "targets": [2,4,6], // 매수금액
+            "render": function (data, type, row) {
+                if (type === 'display') {
+                    return `<span class="text-success">${parseInt(data).toLocaleString()}</span>`;
+                }
+                return data;
+            },
+            "type": "num",
+            "className": "text-end"
+        },
+        {
+            "targets": [3,5,7], // 매도금액
+            "render": function (data, type, row) {
+                if (type === 'display') {
+                    return `<span class="text-danger">${parseInt(data).toLocaleString()}</span>`;
+                }
+                return data;
+            },
+            "type": "num",
+            "className": "text-end"
+        },
+        {
+            "targets": [8,9,10], // 비율(%)
+            "render": function (data, type, row) {
+                if (type === 'display') {
+                    let color = (parseFloat(data) >= 100) ? 'text-success' : 'text-danger';
+                    return `<span class="${color}">${data}%</span>`;
+                }
+                return data;
+            },
+            "type": "num",
+            "className": "text-end"
+        }
+    ]
+});
+
+
+let tradeCounts = {}; // 변화 횟수 카운트용
+let prevAmounts = {}; // 이전 금액 저장용
+
+ws.onmessage = function(event) {
+    let grid = JSON.parse(event.data);
+
+    grid.forEach(row => {
+        let market = row.market;
+        let rowIdx = table.rows().eq(0).filter(function(idx) {
+            return table.cell(idx, 0).data() === market;
+        });
+        if (rowIdx.length > 0) {
+            table.cell(rowIdx[0], 1).data(row.speed);
+            table.cell(rowIdx[0], 2).data(row.bid10);
+            table.cell(rowIdx[0], 3).data(row.ask10);
+            table.cell(rowIdx[0], 4).data(row.bid30);
+            table.cell(rowIdx[0], 5).data(row.ask30);
+            table.cell(rowIdx[0], 6).data(row.bid120);
+            table.cell(rowIdx[0], 7).data(row.ask120);
+            table.cell(rowIdx[0], 8).data(row.ratio10);
+            table.cell(rowIdx[0], 9).data(row.ratio30);
+            table.cell(rowIdx[0], 10).data(row.ratio120);
+        }
+    });
+    table.draw(false);
+};
+
+</script>
+</body>
+</html>
