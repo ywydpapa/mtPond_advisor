@@ -8,12 +8,14 @@ import json
 from collections import defaultdict, deque
 import httpx
 from typing import List
+import datetime
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
 # trade_queues: 모든 마켓-사이드별로 최근 100건 체결금액 저장
-trade_queues = defaultdict(lambda: {'BID': deque(maxlen=120), 'ASK': deque(maxlen=120)})
+trade_queues = defaultdict(lambda: {'BID': deque(maxlen=240), 'ASK': deque(maxlen=240)})
 krw_markets: List[str] = []
 _collect_tasks_started = False
 trade_counts = defaultdict(int)
@@ -74,7 +76,13 @@ async def upbit_collector(markets_chunk: List[str]):
 
 async def reset_trade_counts():
     while True:
-        await asyncio.sleep(60)  # 1분마다
+        now = datetime.datetime.now()
+        if now.minute < 30:
+            next_reset = now.replace(minute=30, second=0, microsecond=0)
+        else:
+            next_reset = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        sleep_seconds = (next_reset - now).total_seconds()
+        await asyncio.sleep(sleep_seconds)
         for market in trade_counts.keys():
             trade_counts[market] = 0
 
@@ -123,10 +131,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 ask30 = round(sum(list(market_data['ASK'])[-30:]), 0)
                 bid120 = round(sum(list(market_data['BID'])[-120:]), 0)
                 ask120 = round(sum(list(market_data['ASK'])[-120:]), 0)
+                bid240 = round(sum(list(market_data['BID'])[-240:]), 0)
+                ask240 = round(sum(list(market_data['ASK'])[-240:]), 0)
                 # 비율
                 ratio10 = round((bid10/ask10)*100, 1) if ask10 > 0 else 0.0
                 ratio30 = round((bid30/ask30)*100, 1) if ask30 > 0 else 0.0
                 ratio120 = round((bid120/ask120)*100, 1) if ask120 > 0 else 0.0
+                ratio240 = round((bid240 / ask240) * 100, 1) if ask240 > 0 else 0.0
                 # 체결속도(예시: 1초마다 1씩 증가, 1분마다 리셋)
                 speed = trade_counts.get(market, 0)
                 row = {
@@ -138,9 +149,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     "ask30": ask30,
                     "bid120": bid120,
                     "ask120": ask120,
+                    "bid240": bid240,
+                    "ask240": ask240,
                     "ratio10": ratio10,
                     "ratio30": ratio30,
                     "ratio120": ratio120,
+                    "ratio240": ratio240,
                 }
                 grid.append(row)
             await websocket.send_json(grid)
@@ -168,9 +182,12 @@ async def websocket_top30trend(websocket: WebSocket):
                 ask30 = round(sum(list(market_data['ASK'])[-30:]), 0)
                 bid120 = round(sum(list(market_data['BID'])[-120:]), 0)
                 ask120 = round(sum(list(market_data['ASK'])[-120:]), 0)
+                bid240 = round(sum(list(market_data['BID'])[-240:]), 0)
+                ask240 = round(sum(list(market_data['ASK'])[-240:]), 0)
                 ratio10 = round((bid10/ask10)*100, 1) if ask10 > 0 else 0.0
                 ratio30 = round((bid30/ask30)*100, 1) if ask30 > 0 else 0.0
                 ratio120 = round((bid120/ask120)*100, 1) if ask120 > 0 else 0.0
+                ratio240 = round((bid240 / ask240) * 100, 1) if ask240 > 0 else 0.0
                 speed = trade_counts.get(market, 0)
                 row = {
                     "market": market,
@@ -181,14 +198,16 @@ async def websocket_top30trend(websocket: WebSocket):
                     "ask30": ask30,
                     "bid120": bid120,
                     "ask120": ask120,
+                    "bid240": bid240,
+                    "ask240": ask240,
                     "ratio10": ratio10,
                     "ratio30": ratio30,
                     "ratio120": ratio120,
+                    "ratio240": ratio240,
                 }
-                # ratio30이 100을 넘는 것만 추가
-                if ratio30 > 100 and speed > 0:
+                # 30개의 매수금액 합이 천만원 넘는 것만 리스트에 넣음
+                if bid30 > 10000000 :
                     result.append(row)
-            # speed 내림차순 정렬
             result.sort(key=lambda x: x['speed'], reverse=True)
             top30 = result[:30]
             await websocket.send_json({
@@ -198,3 +217,18 @@ async def websocket_top30trend(websocket: WebSocket):
             await asyncio.sleep(1)
     except WebSocketDisconnect:
         pass
+
+@app.get("/api/top30coins")
+async def get_top30coins():
+    result = []
+    for market in krw_markets:
+        market_data = trade_queues.get(market)
+        if not market_data:
+            continue
+        bid30 = round(sum(list(market_data['BID'])[-30:]), 0)
+        if bid30 > 10000000:
+            result.append(market)
+    # speed 기준 정렬
+    result.sort(key=lambda m: trade_counts.get(m, 0), reverse=True)
+    top30 = result[:30]
+    return JSONResponse(content={"markets": top30})
