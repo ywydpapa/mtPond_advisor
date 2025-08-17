@@ -267,7 +267,7 @@ def analyze_cross_with_peak_and_vwma(
         subtrguide = "SELL"
     elif vwma_gap <= close_threshold:
         print(f"→ 가격이 long VWMA({long_window})와 0.1% 이내로 접근! 추가 매도 신호!")
-        print(f"→ 가격이 long VWMA({long_window})와 0.1% 이내로 접근 보유코인이 있을 경우 전액 현재가 {now_price} 매도 실행!")
+        print(f"→ 가격이 long VWMA({long_window})   와 0.1% 이내로 접근 보유코인이 있을 경우 전액 현재가 {now_price} 매도 실행!")
         subtrguide = "SELL"
     else:
         print("→ 아직 매도 신호 아님(최고가 하락 미달, long VWMA 접근 미달)")
