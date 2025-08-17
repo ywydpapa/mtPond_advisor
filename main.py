@@ -18,6 +18,10 @@ import xgboost as xgb
 import pandas as pd
 import requests
 from contextlib import asynccontextmanager
+import warnings
+
+
+warnings.filterwarnings("ignore", message="Non-invertible starting MA parameters found. Using zeros as starting parameters.")
 
 
 @asynccontextmanager
@@ -283,9 +287,13 @@ def peak_trade(
     df.set_index('candle_date_time_kst', inplace=True)
     df = df.sort_index(ascending=True)
     try:
+        # 빈도 지정
         freq = pd.infer_freq(df.index)
         if freq:
             df.index = pd.DatetimeIndex(df.index, freq=freq)
+        else:
+            # 빈도가 추정되지 않으면 직접 지정 (예: 1시간)
+            df.index = pd.DatetimeIndex(df.index, freq='H')
     except Exception as e:
         print("freq 지정 실패:", e)
 
@@ -606,7 +614,7 @@ async def get_trend(coin: str):
     if result:
         return JSONResponse(content={"coin": coin, "trend": result})
     else:
-        return JSONResponse(content={"error": "코인 정보 없음"}, status_code=404)
+        return JSONResponse(content={"error": "대상 코인 정보 없음"}, status_code=404)
 
 @app.get("/api/aitrendall")
 async def get_all_trends():
