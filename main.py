@@ -117,14 +117,10 @@ cross_memory = {}
 
 async def get_trendcoins():
     url = 'http://ywydpapa.iptime.org:8000/api/top30coins'
-
     def fetch():
-        # 환경 변수 프록시(trust_env) 무시하여 로컬/죽은 프록시 경유를 방지
         s = requests.Session()
         s.trust_env = False
-        # 혹시 세션 외 전역 프록시가 있을 경우를 대비해 proxies도 무효화
         return s.get(url, timeout=5, proxies={"http": None, "https": None})
-
     loop = asyncio.get_running_loop()
     try:
         response = await loop.run_in_executor(None, fetch)
@@ -171,8 +167,6 @@ async def peak_trade(
     response = requests.get(url)
     data = response.json()
     df = pd.DataFrame(data)
-
-    # 타임존 일관화 처리
     if 'candle_date_time_utc' in df.columns:
         idx = pd.to_datetime(
             df['candle_date_time_utc'],
@@ -182,17 +176,13 @@ async def peak_trade(
         df.set_index(idx, inplace=True)
         df.index.name = 'candle_time_kst'
     else:
-        # Upbit KST 문자열은 타임존 정보가 없으므로 KST로 로컬라이즈
         idx = pd.to_datetime(
             df['candle_date_time_kst'],
             format='%Y-%m-%dT%H:%M:%S'
         ).dt.tz_localize('Asia/Seoul')
         df.set_index(idx, inplace=True)
         df.index.name = 'candle_time_kst'
-
     df = df.sort_index(ascending=True)
-
-    # VWMA 계산 (3, 20)
     df['VWMA_3'] = (
             (df['trade_price'] * df['candle_acc_trade_volume']).rolling(window=3).sum() /
             df['candle_acc_trade_volume'].rolling(window=3).sum()
@@ -201,31 +191,20 @@ async def peak_trade(
             (df['trade_price'] * df['candle_acc_trade_volume']).rolling(window=20).sum() /
             df['candle_acc_trade_volume'].rolling(window=20).sum()
     )
-    # VWMA 차이 계산
     df['vwma_diff'] = df['VWMA_3'] - df['VWMA_20']
-
-    # 골든크로스와 데드크로스 찾기
     golden_cross = df[(df['vwma_diff'].shift(1) < 0) & (df['vwma_diff'] > 0)].copy()
     golden_cross['cross_type'] = 'golden'
     dead_cross = df[(df['vwma_diff'].shift(1) > 0) & (df['vwma_diff'] < 0)].copy()
     dead_cross['cross_type'] = 'dead'
-
-    # 합치고 시간순 정렬
     crosses = pd.concat([golden_cross, dead_cross]).sort_index()
     last_2_crosses = crosses.tail(2)
-
-    # 교차 신호가 없는 경우 방어 처리
     if last_2_crosses.empty:
         print("교차 신호가 없어 경과 시간을 계산할 수 없습니다.")
         return
-
-    # 최종 크로스 이후 경과시간 계산 (둘 다 tz-aware)
     latest_cross_time = last_2_crosses.index[-1]
-    now = pd.Timestamp.now(tz='Asia/Seoul')  # 한국표준시 기준
+    now = pd.Timestamp.now(tz='Asia/Seoul')
     elapsed = now - latest_cross_time
-
     # VWMA 방향(상승/하강) 및 기울기(변화량) 판별
-
     if len(df) >= 2:
         vwma3_dir = 'UP' if df['VWMA_3'].iloc[-1] > df['VWMA_3'].iloc[-2] else 'DN'
         vwma20_dir = 'UP' if df['VWMA_20'].iloc[-1] > df['VWMA_20'].iloc[-2] else 'DN'
@@ -240,7 +219,6 @@ async def peak_trade(
         vwma3_dir = vwma20_dir = 'N/A'
         vwma3_slope = vwma20_slope = volume_slope = None
         vwma3_angle = vwma20_angle = volume_angle = None
-
     cross_memory[ticker] = {
         'last_2_crosses': [
             {
@@ -261,14 +239,6 @@ async def peak_trade(
         'volume': df['candle_acc_trade_volume'].iloc[-1],
         'volume_angle': volume_angle
     }
-    # print(f"\n대상 코인:",ticker)
-    # print(f"최종 크로스 종류: {last_2_crosses.iloc[-1]['cross_type']}")
-    # print(f"최종 크로스 발생 시간: {latest_cross_time}")
-    # print(f"현재 시간: {now}")
-    # print(f"최종 크로스 이후 경과시간: {elapsed}")
-    # print(f"VWMA_3: {df['VWMA_3'].iloc[-1]:.2f} ({vwma3_dir}, 기울기: {vwma3_angle:.2f})")
-    # print(f"VWMA_20: {df['VWMA_20'].iloc[-1]:.2f} ({vwma20_dir}, 기울기: {vwma20_angle:.2f})")
-    # print(f"거래량 기울기: {volume_angle:.2f}")
 
 
 async def trend_loop():
@@ -283,7 +253,6 @@ async def trend_loop():
             try:
                 await peak_trade(ticker=coin, candle_unit='3m')
             except Exception as e:
-                # 개별 코인 처리 실패가 전체 루프를 멈추지 않도록 방어
                 print(f"peak_trade 실패({coin}): {e}")
             await asyncio.sleep(0.5)
         await asyncio.sleep(60)
@@ -425,6 +394,6 @@ async def get_top30coins():
     return JSONResponse(content={"markets": top30})
 
 
-@app.get("/api/aitrendall")
+@app.get("/api/aitrendt30")
 async def get_all_trends():
     return JSONResponse(content=jsonable_encoder(cross_memory))

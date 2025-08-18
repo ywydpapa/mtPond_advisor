@@ -29,6 +29,7 @@
                 <th class="text-center">RATE 30</th>
                 <th class="text-center">RATE 120</th>
                 <th class="text-center">RATE 240</th>
+                <th class="text-center">TREND</th>
             </tr>
         </thead>
         <tbody>
@@ -42,7 +43,7 @@
 <script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
 
 <script>
-    let ws = new WebSocket("ws://ywydpapa.iptime.org:8000/ws/top30trend");
+    let ws = new WebSocket("ws://ywpapa.iptime.org:8000/ws/top30trend");
 
     ws.onopen = function() {
         console.log("WebSocket 연결됨");
@@ -104,16 +105,52 @@
             },
             "type": "num",
             "className": "text-end"
-        }
+        },
+        {
+        "targets": [14], // TREND 컬럼 인덱스
+        "render": function(data, type, row) {
+            // data: {type, elapsed}
+            if (type === 'display') {
+                if (!data) return '';
+                let cross = data.type === 'golden' ? '<span class="text-success fw-bold">G</span>' :
+                            data.type === 'dead' ? '<span class="text-danger fw-bold">D</span>' : '';
+                let min = Math.floor(data.elapsed / 60);
+                let sec = Math.floor(data.elapsed % 60);
+                let elapsedStr = `${min}:${sec.toString().padStart(2, '0')}`;
+                return `${cross} <span class="text-muted">${elapsedStr}</span>`;
+            }
+            return data;
+        },
+        "className": "text-center"
+    }
     ]
 });
+
+    let trendData = {}; // aitrendall 결과 저장
+
+function fetchTrendData() {
+    $.get('http://ywpapa.iptime.org:8000/api/aitrendt30', function(data) {
+        trendData = data;
+    });
+}
+fetchTrendData();
+setInterval(fetchTrendData, 60000); // 1분마다 갱신
 
     ws.onmessage = function(event) {
         let data = JSON.parse(event.data);
         let coins = data.coins;
         table.clear();
         coins.forEach(row => {
-            table.row.add([
+        // trendData에서 코인 정보 가져오기
+        let trend = trendData[row.market] || null;
+        let trendCell = null;
+        if (trend) {
+            trendCell = {
+                type: trend.latest_cross_type,
+                elapsed: trend.elapsed
+            };
+        }
+        table.row.add([
                 row.market,
                 row.speed,
                 row.bid10,
@@ -127,7 +164,8 @@
                 row.ratio10,
                 row.ratio30,
                 row.ratio120,
-                row.ratio240
+                row.ratio240,
+            trendCell
             ]);
         });
         table.draw(false);
