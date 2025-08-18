@@ -23,6 +23,7 @@ import pandas as pd
 import requests
 from contextlib import asynccontextmanager
 import warnings
+from fastapi.middleware.cors import CORSMiddleware
 
 
 @asynccontextmanager
@@ -46,6 +47,14 @@ krw_markets = []
 _collect_tasks_started = False
 trade_counts = defaultdict(int)
 trend_cache = {}
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 모든 도메인 허용 (보안상 실제 운영에서는 제한 필요)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 

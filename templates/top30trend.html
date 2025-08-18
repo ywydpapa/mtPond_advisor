@@ -43,7 +43,7 @@
 <script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
 
 <script>
-    let ws = new WebSocket("ws://ywpapa.iptime.org:8000/ws/top30trend");
+    let ws = new WebSocket("ws://ywydpapa.iptime.org:8000/ws/top30trend");
 
     ws.onopen = function() {
         console.log("WebSocket 연결됨");
@@ -129,7 +129,7 @@
     let trendData = {}; // aitrendall 결과 저장
 
 function fetchTrendData() {
-    $.get('http://ywpapa.iptime.org:8000/api/aitrendt30', function(data) {
+    $.get('http://ywydpapa.iptime.org:8000/api/aitrendall', function(data) {
         trendData = data;
     });
 }
