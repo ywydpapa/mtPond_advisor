@@ -1,10 +1,11 @@
+import asyncio
+import requests
 import time
 import numpy as np
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse
 from starlette.websockets import WebSocketDisconnect
-import asyncio
 import websockets
 import json
 from fastapi.encoders import jsonable_encoder
@@ -116,10 +117,27 @@ cross_memory = {}
 
 async def get_trendcoins():
     url = 'http://ywydpapa.iptime.org:8000/api/top30coins'
-    response = requests.get(url)
-    data = response.json()
-    coins = data['markets']
-    return coins
+
+    def fetch():
+        # 환경 변수 프록시(trust_env) 무시하여 로컬/죽은 프록시 경유를 방지
+        s = requests.Session()
+        s.trust_env = False
+        # 혹시 세션 외 전역 프록시가 있을 경우를 대비해 proxies도 무효화
+        return s.get(url, timeout=5, proxies={"http": None, "https": None})
+
+    loop = asyncio.get_running_loop()
+    try:
+        response = await loop.run_in_executor(None, fetch)
+        response.raise_for_status()
+        data = response.json()
+        coins = data.get('markets', [])
+        if not isinstance(coins, list):
+            print("get_trendcoins: 예상치 못한 응답 형식(markets가 리스트 아님).")
+            return []
+        return coins
+    except Exception as e:
+        print(f"get_trendcoins: 요청 실패 - {e}")
+        return []
 
 
 async def peak_trade(
@@ -256,8 +274,17 @@ async def peak_trade(
 async def trend_loop():
     while True:
         coins = await get_trendcoins()
+        if not coins:
+            # 실패 또는 빈 응답 시 잠시 대기 후 재시도 (프록시/네트워크 불안정 대응)
+            await asyncio.sleep(5)
+            continue
+
         for coin in coins:
-            await peak_trade(ticker=coin, candle_unit='3m')
+            try:
+                await peak_trade(ticker=coin, candle_unit='3m')
+            except Exception as e:
+                # 개별 코인 처리 실패가 전체 루프를 멈추지 않도록 방어
+                print(f"peak_trade 실패({coin}): {e}")
             await asyncio.sleep(0.5)
         await asyncio.sleep(60)
 
