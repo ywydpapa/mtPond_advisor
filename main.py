@@ -243,14 +243,14 @@ async def peak_trade(
         'volume': df['candle_acc_trade_volume'].iloc[-1],
         'volume_angle': volume_angle
     }
-    print(f"\n대상 코인:",ticker)
-    print(f"최종 크로스 종류: {last_2_crosses.iloc[-1]['cross_type']}")
-    print(f"최종 크로스 발생 시간: {latest_cross_time}")
-    print(f"현재 시간: {now}")
-    print(f"최종 크로스 이후 경과시간: {elapsed}")
-    print(f"VWMA_3: {df['VWMA_3'].iloc[-1]:.2f} ({vwma3_dir}, 기울기: {vwma3_angle:.2f})")
-    print(f"VWMA_20: {df['VWMA_20'].iloc[-1]:.2f} ({vwma20_dir}, 기울기: {vwma20_angle:.2f})")
-    print(f"거래량 기울기: {volume_angle:.2f}")
+    # print(f"\n대상 코인:",ticker)
+    # print(f"최종 크로스 종류: {last_2_crosses.iloc[-1]['cross_type']}")
+    # print(f"최종 크로스 발생 시간: {latest_cross_time}")
+    # print(f"현재 시간: {now}")
+    # print(f"최종 크로스 이후 경과시간: {elapsed}")
+    # print(f"VWMA_3: {df['VWMA_3'].iloc[-1]:.2f} ({vwma3_dir}, 기울기: {vwma3_angle:.2f})")
+    # print(f"VWMA_20: {df['VWMA_20'].iloc[-1]:.2f} ({vwma20_dir}, 기울기: {vwma20_angle:.2f})")
+    # print(f"거래량 기울기: {volume_angle:.2f}")
 
 
 async def trend_loop():
