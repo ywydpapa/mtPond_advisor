@@ -107,69 +107,94 @@
             "className": "text-end"
         },
         {
-        "targets": [14], // TREND 컬럼 인덱스
-        "render": function(data, type, row) {
-            // data: {type, elapsed}
-            if (type === 'display') {
-                if (!data) return '';
-                let cross = data.type === 'golden' ? '<span class="text-success fw-bold">G</span>' :
-                            data.type === 'dead' ? '<span class="text-danger fw-bold">D</span>' : '';
-                let min = Math.floor(data.elapsed / 60);
-                let sec = Math.floor(data.elapsed % 60);
-                let elapsedStr = `${min}:${sec.toString().padStart(2, '0')}`;
-                return `${cross} <span class="text-muted">${elapsedStr}</span>`;
+    "targets": [14], // TREND 컬럼 인덱스
+    "render": function(data, type, row) {
+        if (type === 'display') {
+            if (!data) return '';
+            // 크로스 표시
+            let cross = data.type === 'golden' ? '<span class="text-success fw-bold">G</span>' :
+                        data.type === 'dead' ? '<span class="text-danger fw-bold">D</span>' : '';
+            // 경과 시간 표시
+            let min = Math.floor(data.elapsed / 60);
+            let sec = Math.floor(data.elapsed % 60);
+            let elapsedStr = `${min}:${sec.toString().padStart(2, '0')}`;
+            // VWMA 화살표
+            let arrows = '';
+            if (data.VWMA_3_dir && data.VWMA_3_angle !== undefined) {
+                arrows += getArrow(data.VWMA_3_dir, data.VWMA_3_angle);
             }
-            return data;
-        },
-        "className": "text-center"
-    }
+            if (data.VWMA_20_dir && data.VWMA_20_angle !== undefined) {
+                arrows += getArrow(data.VWMA_20_dir, data.VWMA_20_angle);
+            }
+            return `${cross} <span class="text-muted">${elapsedStr}</span><br> ${arrows}`;
+        }
+        return data;
+    },
+    "className": "text-center"
+}
     ]
 });
 
     let trendData = {}; // aitrendall 결과 저장
 
+    function getArrow(dir, angle) {
+    if (dir === "UP") {
+        if (angle >= 45) return '<span style="color:green;">(▲▲)</span>';
+        else return '<span style="color:green;">(▲)</span>';
+    }
+    if (dir === "DN") {
+        if (angle <= -45) return '<span style="color:red;">(▼▼)</span>';
+        else return '<span style="color:red;">(▼)</span>';
+    }
+    return '';
+}
+
 function fetchTrendData() {
-    $.get('http://ywydpapa.iptime.org:8000/api/aitrendall', function(data) {
+    $.get('http://ywydpapa.iptime.org:8000/api/aitrendt30', function(data) {
         trendData = data;
     });
 }
 fetchTrendData();
-setInterval(fetchTrendData, 60000); // 1분마다 갱신
+setInterval(fetchTrendData, 30000); // 0.5분마다 갱신
 
     ws.onmessage = function(event) {
-        let data = JSON.parse(event.data);
-        let coins = data.coins;
-        table.clear();
-        coins.forEach(row => {
-        // trendData에서 코인 정보 가져오기
-        let trend = trendData[row.market] || null;
+    let data = JSON.parse(event.data);
+    let coins = data.coins;
+    table.clear();
+    coins.forEach(row => {
+        let trend = trendData[row.market]; // 이 부분 추가
         let trendCell = null;
         if (trend) {
             trendCell = {
                 type: trend.latest_cross_type,
-                elapsed: trend.elapsed
+                elapsed: trend.elapsed,
+                VWMA_3_dir: trend.VWMA_3_dir,
+                VWMA_20_dir: trend.VWMA_20_dir,
+                VWMA_3_angle: trend.VWMA_3_angle,
+                VWMA_20_angle: trend.VWMA_20_angle
             };
         }
         table.row.add([
-                row.market,
-                row.speed,
-                row.bid10,
-                row.ask10,
-                row.bid30,
-                row.ask30,
-                row.bid120,
-                row.ask120,
-                row.bid240,
-                row.ask240,
-                row.ratio10,
-                row.ratio30,
-                row.ratio120,
-                row.ratio240,
+            row.market,
+            row.speed,
+            row.bid10,
+            row.ask10,
+            row.bid30,
+            row.ask30,
+            row.bid120,
+            row.ask120,
+            row.bid240,
+            row.ask240,
+            row.ratio10,
+            row.ratio30,
+            row.ratio120,
+            row.ratio240,
             trendCell
-            ]);
-        });
-        table.draw(false);
-    };
+        ]);
+    });
+    table.draw(false);
+};
+
 
 </script>
 </body>

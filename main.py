@@ -260,7 +260,7 @@ async def trend_loop():
 
         for coin in coins:
             try:
-                await peak_trade(ticker=coin, candle_unit='3m')
+                await peak_trade(ticker=coin, candle_unit='1m')
             except Exception as e:
                 print(f"peak_trade 실패({coin}): {e}")
             await asyncio.sleep(0.5)
