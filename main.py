@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
         for chunk in chunk_markets(krw_markets, 50):
             asyncio.create_task(upbit_collector(chunk))
         asyncio.create_task(reset_trade_counts())
-        asyncio.create_task(update_trends())
+        # asyncio.create_task(update_trends())
         _collect_tasks_started = True
     yield
     # (종료시 정리 코드 필요시 여기에)
@@ -255,7 +255,7 @@ def predict_price_xgb(df, periods=3):
         return None
 
 
-def peak_trade(
+async def peak_trade(
         ticker='KRW-BTC',
         short_window=3,
         long_window=20,
@@ -460,15 +460,9 @@ async def update_trends():
         for coin in coins:
             try:
                 # 여러 단위(5m, 15m, 3m)로 트렌드 계산
-                short_position = peak_trade(coin, 1, 20, 200, '5m')
-                time.sleep(0.2)
-                mid_position = peak_trade(coin, 1, 20, 200, '15m')
-                time.sleep(0.2)
-                test_position = peak_trade(coin, 1, 20, 200, '3m')
-                time.sleep(0.2)
+                test_position = await peak_trade(coin, 3, 20, 200, '3m')
+                print(f"{coin} 3m: {test_position}")
                 trend_cache[coin] = {
-                    '5m': short_position,
-                    '15m': mid_position,
                     '3m': test_position,
                     'updated': datetime.datetime.now().isoformat()
                 }
