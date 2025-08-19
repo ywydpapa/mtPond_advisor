@@ -218,12 +218,16 @@ async def peak_trade(
         vwma3_dir = 'UP' if df['VWMA_3'].iloc[-1] > df['VWMA_3'].iloc[-2] else 'DN'
         vwma20_dir = 'UP' if df['VWMA_20'].iloc[-1] > df['VWMA_20'].iloc[-2] else 'DN'
         vwma3_slope = df['VWMA_3'].iloc[-1] - df['VWMA_3'].iloc[-2]
-        vwma20_slope = (df['VWMA_20'].iloc[-1] - df['VWMA_20'].iloc[-6]) / 5
+        vwma20_now = df['VWMA_20'].iloc[-1]
+        vwma20_mean = df['VWMA_20'].iloc[-6:].mean()
+        vwma20_slope = vwma20_now - vwma20_mean
+        vwma20_angle = np.degrees(np.arctan(vwma20_slope))
         volume_slope = df['candle_acc_trade_volume'].iloc[-1] - df['candle_acc_trade_volume'].iloc[-2]
         vwma3_angle = np.degrees(np.arctan(vwma3_slope))
-        vwma20_angle = np.degrees(np.arctan(vwma20_slope))
         volume_angle = np.degrees(np.arctan(volume_slope))
     else:
+        vwma20_slope = None
+        vwma20_angle = None
         vwma3_dir = vwma20_dir = 'N/A'
         vwma3_slope = vwma20_slope = volume_slope = None
         vwma3_angle = vwma20_angle = volume_angle = None
