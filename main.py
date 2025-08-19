@@ -214,13 +214,12 @@ async def peak_trade(
     now = pd.Timestamp.now(tz='Asia/Seoul')
     elapsed = now - latest_cross_time
     # VWMA 방향(상승/하강) 및 기울기(변화량) 판별
-    if len(df) >= 2:
+    if len(df) >= 6:
         vwma3_dir = 'UP' if df['VWMA_3'].iloc[-1] > df['VWMA_3'].iloc[-2] else 'DN'
         vwma20_dir = 'UP' if df['VWMA_20'].iloc[-1] > df['VWMA_20'].iloc[-2] else 'DN'
         vwma3_slope = df['VWMA_3'].iloc[-1] - df['VWMA_3'].iloc[-2]
-        vwma20_slope = df['VWMA_20'].iloc[-1] - df['VWMA_20'].iloc[-2]
+        vwma20_slope = (df['VWMA_20'].iloc[-1] - df['VWMA_20'].iloc[-6]) / 5
         volume_slope = df['candle_acc_trade_volume'].iloc[-1] - df['candle_acc_trade_volume'].iloc[-2]
-        # 각도 변환
         vwma3_angle = np.degrees(np.arctan(vwma3_slope))
         vwma20_angle = np.degrees(np.arctan(vwma20_slope))
         volume_angle = np.degrees(np.arctan(volume_slope))

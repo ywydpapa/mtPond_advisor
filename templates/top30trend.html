@@ -139,12 +139,16 @@
 
     function getArrow(dir, angle) {
     if (dir === "UP") {
-        if (angle >= 45) return '<span style="color:green;">(▲▲)</span>';
-        else return '<span style="color:green;">(▲)</span>';
+        if (angle >= 30) return '<span style="color:green;">(▲▲)</span>';
+        else if(angle >= 60) return '<span style="color:green;">(▲▲▲)</span>';
+        else if(angle >= 5) return '<span style="color:green;">(▲)</span>';
+        else return '<span style="color:green;">(-)</span>';
     }
     if (dir === "DN") {
-        if (angle <= -45) return '<span style="color:red;">(▼▼)</span>';
-        else return '<span style="color:red;">(▼)</span>';
+        if (angle <= -30) return '<span style="color:red;">(▼▼)</span>';
+        else if (angle <= -60) return '<span style="color:red;">(▼▼▼)</span>';
+        else if (angle <= -5) return '<span style="color:red;">(▼)</span>';
+        else return '<span style="color:red;">(-)</span>';
     }
     return '';
 }
