@@ -2,7 +2,7 @@ import asyncio
 import requests
 import time
 import numpy as np
-from fastapi import FastAPI, Request, WebSocket
+from fastapi import FastAPI, Request, WebSocket, Depends
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse
 from starlette.websockets import WebSocketDisconnect
@@ -24,6 +24,12 @@ import requests
 from contextlib import asynccontextmanager
 import warnings
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+import json
+import dotenv
+import os
 
 
 @asynccontextmanager
@@ -39,6 +45,10 @@ async def lifespan(app: FastAPI):
     yield
     # (종료시 정리 코드 필요시 여기에)
 
+dotenv.load_dotenv()
+DATABASE_URL = os.getenv("dburl")
+engine = create_async_engine(DATABASE_URL, echo=True)
+async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 warnings.filterwarnings("ignore", message="Non-invertible starting MA parameters found. Using zeros as starting parameters.")
 app = FastAPI(lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
@@ -56,7 +66,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+async def get_current_prices():
+    server_url = "https://api.upbit.com"
+    params = {"quote_currencies": "KRW"}
+    res = requests.get(server_url + "/v1/ticker/all", params=params)
+    data = res.json()
+    result = []
+    for item in data:
+        market = item.get("market")
+        trade_price = item.get("trade_price")
+        if market and trade_price:
+            result.append({"market": market, "trade_price": trade_price})
+    return result
 
+
+async def get_current_price(coinn):
+    server_url = "https://api.upbit.com"
+    params = {"quote_currencies": "KRW"}
+    res = requests.get(server_url + "/v1/ticker/all", params=params)
+    data = res.json()
+    result = []
+    for item in data:
+        market = item.get("market")
+        trade_price = item.get("trade_price")
+        if market and trade_price and market == coinn:
+            result.append({"market": market, "trade_price": trade_price})
+    return result
+
+async def get_db():
+    async with async_session() as session:
+        yield session
 
 # 전체 코인 코드 가져오기
 async def get_krw_markets() -> List[str]:
@@ -409,3 +448,164 @@ async def get_top30coins():
 @app.get("/api/aitrendt30")
 async def get_all_trends():
     return JSONResponse(content=jsonable_encoder(cross_memory))
+
+@app.get("/phapp/tradesetup/{uno}")
+async def phapp_tradesetup(uno: int, db: AsyncSession = Depends(get_db)):
+    setups = None
+    try:
+        query = text("SELECT * FROM polarisSets where userNo = :uno and attrib not like :attxx")
+        result = await db.execute(query, {"uno": uno, "attxx": "%XXX%"})
+        rows = result.fetchall()
+        setups = [
+            {
+                "coinName":row[2],
+                "stepAmt":row[3],
+                "tradeType":row[4],
+                "maxAmt":row[5],
+                "useYN":row[6]
+            } for row in rows
+        ]
+        query2 = text("SELECT changeType, currency,unitPrice,inAmt,outAmt,remainAmt,regDate FROM trWallet where userNo = :uno and attrib not like :attxx order by currency ")
+        result2 = await db.execute(query2, {"uno": uno, "attxx": "%XXX%"})
+        rows2 = result2.fetchall()
+        mycoins = [{
+            "changeType": row2[0],
+            "currency": row2[1],
+            "unitPrice": row2[2],
+            "inAmt": row2[3],
+            "outAmt": row2[4],
+            "remainAmt": row2[5],
+            "regDate": row2[6]
+        } for row2 in rows2]
+        cprices = await get_current_prices()
+        return setups, mycoins, cprices
+    except Exception as e:
+        print("Init Error !!", e)
+
+@app.get("/phapp/tradelog/{uno}")
+async def tradelog(uno: int, db: AsyncSession = Depends(get_db)):
+    mycoins = None
+    try:
+        query = text("SELECT changeType, currency,unitPrice,inAmt,outAmt,remainAmt,regDate FROM trWallet where linkNo = (select max(linkNo) from trWallet where userNo = :uno) order by regDate asc")
+        result = await db.execute(query, {"uno": uno})
+        rows = result.fetchall()
+        mycoins = [{
+            "changeType":row[0],
+            "currency":row[1],
+            "unitPrice":row[2],
+            "inAmt":row[3],
+            "outAmt":row[4],
+            "remainAmt":row[5],
+            "regDate":row[6]
+        }
+            for row in rows
+        ]
+    except Exception as e:
+        print("Init Error !!", e)
+    return mycoins
+
+@app.get("/phapp/hotcoinlist")
+async def hotcoins(db: AsyncSession = Depends(get_db)):
+    try:
+        query = text("SELECT * FROM orderbookAmt where dateTag = (select max(dateTag) from orderbookAmt)")
+        result = await db.execute(query)
+        rows = result.fetchall()
+        orderbooks = [
+            {
+                "dateTag":row[1],
+                "idxRow":row[2],
+                "coinName":row[3],
+                "bidAmt":row[4],
+                "askAmt":row[5],
+                "totalAmt":row[6],
+                "amtDiff":row[7]
+            }
+            for row in rows
+        ]
+        return orderbooks
+    except Exception as e:
+        print("Get Hotcoins Error !!", e)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/phapp/mlogin/{phoneno}/{passwd}")
+async def mlogin(phoneno: str,passwd:str, db: AsyncSession = Depends(get_db)):
+    try:
+        query = text("SELECT userNo, userName,setupKey from trUser where userId = :phoneno and userPasswd = PASSWORD(:passwd)")
+        result = await db.execute(query, {"phoneno": phoneno, "passwd": passwd})
+        rows = result.fetchone()
+        if rows is None:
+            return {"error": "No data found for the given data."}
+        result = {"userno": rows[0], "username": rows[1], "setupkey": rows[2]}
+    except:
+        print("mLogin error")
+    finally:
+        return result
+
+@app.get("/rest_add_predict/{dateTag}/{coinName}/{avgUprate}/{avgDownrate}/{currentPrice}/{predictA}/{predictB}/{predictC}/{predictD}/{rateA}/{rateB}/{rateC}/{rateD}/{intv}")
+async def rest_add_predict(request:Request,dateTag:str,coinName:str,avgUprate:float,avgDownrate:float,currentPrice:float,predictA:float,predictB:float,predictC:float,predictD:float,rateA:float,rateB:float,rateC:float,rateD:float,intv:str, db: AsyncSession = Depends(get_db)):
+    result = await rest_predict(dateTag,coinName,avgUprate,avgDownrate,currentPrice,predictA,predictB,predictC,predictD,rateA,rateB,rateC,rateD,intv, db)
+    if result:
+        return True
+    else:
+        return False
+
+@app.get("/restaddorderbookamt/{datetag}/{idxrow}/{coinn}/{bidamt}/{askamt}/{totalamt}/{amtdiff}")
+async def restaddorderbookamt(request: Request, datetag: str, idxrow: int, coinn: str, bidamt: int, askamt: int,
+                              totalamt: int, amtdiff: float, db: AsyncSession = Depends(get_db)):
+    try:
+        act = await rest_add_orderbook_amt(datetag, idxrow, coinn, bidamt, askamt, totalamt, amtdiff, db)
+        print(act)
+        return JSONResponse({"success": True})
+    except Exception as e:
+        print("Error!!", e)
+        return JSONResponse({"success": False})
+
+@app.get("/restaddtradeamt/{bidamt}/{askamt}")
+async def restaddtradeamt(request: Request, bidamt: int, askamt: int, db: AsyncSession = Depends(get_db)):
+    try:
+        act = await rest_add_trade_amt(bidamt, askamt, db)
+        return JSONResponse({"success": True})
+    except Exception as e:
+        print("Error!!", e)
+        return JSONResponse({"success": False})
+
+@app.get("/privacy")
+async def privacy(request: Request):
+    return templates.TemplateResponse("/privacy/privacy.html", {"request": request})
+
+async def rest_add_trade_amt(bidamt, askamt, db):
+    try:
+        query = text("INSERT INTO tradeAmt (bidAmt, askAmt) VALUES (:bidamt, :askamt)")
+        await db.execute(query, {"bidamt": bidamt, "askamt": askamt})
+        await db.commit()
+        return True
+    except Exception as e:
+        print("Error!!", e)
+        return False
+
+
+async def rest_add_orderbook_amt(datetag, idxrow, coinn, bidamt, askamt, totalamt, amtdiff, db):
+    try:
+        query = text(
+            "INSERT INTO orderbookAmt (dateTag, idxRow, coinName, bidAmt, askAmt, totalAmt, amtDiff) values (:dateTag, :idxRow, :coinName, :bidAmt, :askAmt, :totalAmt, :amtDiff)")
+        await db.execute(query,
+                         {"dateTag": datetag, "idxRow": idxrow, "coinName": coinn, "bidAmt": bidamt, "askAmt": askamt,
+                          "totalAmt": totalamt, "amtDiff": amtdiff})
+        await db.commit()
+        return True
+    except Exception as e:
+        print("Error!!", e)
+        return False
+
+
+async def rest_predict(dateTag,coinName,avgUprate,avgDownrate,currentPrice,predictA,predictB,predictC,predictD,rateA,rateB,rateC,rateD,intV,db):
+    try:
+        query = text("INSERT into predictPrice (dateTag,coinName,avgUprate,avgDownrate,currentPrice,predictA,predictB,predictC,predictD,rateA,rateB,rateC,rateD,intV) values (:dateTag,:coinName,:avgUprate,:avgDownrate,:currentPrice,:predictA,:predictB,:predictC,:predictD,:rateA,:rateB,:rateC,:rateD,:intv)")
+        await db.execute(query,{"dateTag":dateTag, "coinName": coinName, "avgUprate": avgUprate, "avgDownrate": avgDownrate, "currentPrice": currentPrice, "predictA": predictA,"predictB": predictB,"predictC": predictC,"predictD": predictD, "rateA":rateA,"rateB":rateB,"rateC":rateC,"rateD":rateD,"intv":intV})
+        await db.commit()
+        return True
+    except Exception as e:
+        print("Error!!", e)
+        return False
+
+
