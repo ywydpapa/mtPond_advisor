@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Upbit 코인 실시간 상위 30</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- DataTables CSS -->
+    <link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css"/>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon" />
+
+</head>
+<body>
+<div class="container-fluid mt-5">
+    <h2 class="mb-4">Upbit 코인 실시간 체결금액 상위 30 모니터링</h2>
+    <table class="table table-striped table-bordered align-middle text-center" id="trade-table">
+        <thead class="table-light">
+            <tr style="text-align: center;">
+                <th class="text-center">코인명</th>
+                <th class="text-center">체결량</th>
+                <th class="text-center">매수(10)</th>
+                <th class="text-center">매도(10)</th>
+                <th class="text-center">매수(30)</th>
+                <th class="text-center">매도(30)</th>
+                <th class="text-center">매수(120)</th>
+                <th class="text-center">매도(120)</th>
+                <th class="text-center">매수(240)</th>
+                <th class="text-center">매도(240)</th>
+                <th class="text-center">RATE 10</th>
+                <th class="text-center">RATE 30</th>
+                <th class="text-center">RATE 120</th>
+                <th class="text-center">RATE 240</th>
+                <th class="text-center">TREND</th>
+            </tr>
+        </thead>
+        <tbody>
+        </tbody>
+    </table>
+</div>
+
+<!-- jQuery, DataTables JS -->
+<script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
+
+<script>
+    let ws = new WebSocket("ws://ywydpapa.iptime.org:8000/ws/top30trend");
+
+    ws.onopen = function() {
+        console.log("WebSocket 연결됨");
+    };
+    ws.onerror = function(e) {
+        console.error("WebSocket 에러", e);
+    };
+
+
+    let table = $('#trade-table').DataTable({
+    "paging": true,
+    "searching": true,
+    "ordering": true,
+    "info": false,
+    "pageLength": 30,
+    "order": [[2, "desc"]],
+    "columnDefs": [
+        {
+        "targets": [0],
+        "className": "text-center",
+        "render": function(data, type, row) {
+            if (type === 'display') {
+                return `<a href="https://upbit.com/exchange?code=CRIX.UPBIT.${data}" target="_blank">${data}</a>`;
+            }
+            return data;
+        }
+        },
+        { "targets": [1], "className": "text-center" },
+        {
+            "targets": [2,4,6,8], // 매수금액
+            "render": function (data, type, row) {
+                if (type === 'display') {
+                    return `<span class="text-success">${parseInt(data).toLocaleString()}</span>`;
+                }
+                return data;
+            },
+            "type": "num",
+            "className": "text-end"
+        },
+        {
+            "targets": [3,5,7,9], // 매도금액
+            "render": function (data, type, row) {
+                if (type === 'display') {
+                    return `<span class="text-danger">${parseInt(data).toLocaleString()}</span>`;
+                }
+                return data;
+            },
+            "type": "num",
+            "className": "text-end"
+        },
+        {
+            "targets": [10,11,12,13], // 비율(%)
+            "render": function (data, type, row) {
+                if (type === 'display') {
+                    let color = (parseFloat(data) >= 100) ? 'text-success' : 'text-danger';
+                    return `<span class="${color}">${data}%</span>`;
+                }
+                return data;
+            },
+            "type": "num",
+            "className": "text-end"
+        },
+        {
+    "targets": [14], // TREND 컬럼 인덱스
+    "render": function(data, type, row) {
+        if (type === 'display') {
+            if (!data) return '';
+            // 크로스 표시
+            let cross = data.type === 'golden' ? '<span class="text-success fw-bold">G</span>' :
+                        data.type === 'dead' ? '<span class="text-danger fw-bold">D</span>' : '';
+            // 경과 시간 표시
+            let min = Math.floor(data.elapsed / 60);
+            let sec = Math.floor(data.elapsed % 60);
+            let elapsedStr = `${min}:${sec.toString().padStart(2, '0')}`;
+            // VWMA 화살표
+            let arrows = '';
+            if (data.VWMA_3_dir && data.VWMA_3_angle !== undefined) {
+                arrows += getArrow(data.VWMA_3_dir, data.VWMA_3_angle);
+            }
+            if (data.VWMA_20_dir && data.VWMA_20_angle !== undefined) {
+                arrows += getArrow(data.VWMA_20_dir, data.VWMA_20_angle);
+            }
+            return `${cross} <span class="text-muted">${elapsedStr}</span><br> ${arrows}`;
+        }
+        return data;
+    },
+    "className": "text-center"
+}
+    ]
+});
+
+    let trendData = {}; // aitrendall 결과 저장
+
+    function getArrow(dir, angle) {
+    if (dir === "UP") {
+        if (angle >= 30) return '<span style="color:green;">(▲▲)</span>';
+        else if(angle >= 60) return '<span style="color:green;">(▲▲▲)</span>';
+        else if(angle >= 5) return '<span style="color:green;">(▲)</span>';
+        else return '<span style="color:green;">(-)</span>';
+    }
+    if (dir === "DN") {
+        if (angle <= -30) return '<span style="color:red;">(▼▼)</span>';
+        else if (angle <= -60) return '<span style="color:red;">(▼▼▼)</span>';
+        else if (angle <= -5) return '<span style="color:red;">(▼)</span>';
+        else return '<span style="color:red;">(-)</span>';
+    }
+    return '';
+}
+
+function fetchTrendData() {
+    $.get('http://ywydpapa.iptime.org:8000/api/bbtrend30', function(data) {
+        trendData = data;
+    });
+}
+fetchTrendData();
+setInterval(fetchTrendData, 30000); // 0.5분마다 갱신
+
+    ws.onmessage = function(event) {
+    let data = JSON.parse(event.data);
+    let coins = data.coins;
+    table.clear();
+    coins.forEach(row => {
+        let trend = trendData[row.market]; // 이 부분 추가
+        let trendCell = null;
+        if (trend) {
+            trendCell = {
+                type: trend.latest_cross_type,
+                elapsed: trend.elapsed,
+                VWMA_3_dir: trend.VWMA_3_dir,
+                VWMA_20_dir: trend.VWMA_20_dir,
+                VWMA_3_angle: trend.VWMA_3_angle,
+                VWMA_20_angle: trend.VWMA_20_angle
+            };
+        }
+        table.row.add([
+            row.market,
+            row.speed,
+            row.bid10,
+            row.ask10,
+            row.bid30,
+            row.ask30,
+            row.bid120,
+            row.ask120,
+            row.bid240,
+            row.ask240,
+            row.ratio10,
+            row.ratio30,
+            row.ratio120,
+            row.ratio240,
+            trendCell
+        ]);
+    });
+    table.draw(false);
+};
+
+
+</script>
+</body>
+</html>
