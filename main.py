@@ -5,13 +5,14 @@ import datetime
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 import warnings
-
+import re
 import requests
 import httpx
 import websockets
 import numpy as np
 import pandas as pd
-
+import time
+import random
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Depends
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -60,7 +61,7 @@ app.add_middleware(
 # ========================== 다중 타임프레임 Bollinger Collector 설정 ==========================
 TOP30_ENDPOINT = os.getenv("TOP30_ENDPOINT", "http://127.0.0.1:8000/api/top30coins")
 
-BB_TIMEFRAMES = [5, 15, 30]   # 분 단위
+BB_TIMEFRAMES = [3, 5, 15, 30]   # 분 단위
 BB_CANDLE_COUNT = 200
 BB_SEMAPHORE_LIMIT = 8
 BB_LOOP_INTERVAL = 180        # 3분
@@ -222,14 +223,12 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         out["Lower"] = np.nan
         out["BB_Pos"] = 0.0
         out["BandWidth"] = 0.0
-
     # HH/LL
     out["HH20"] = out["high"].rolling(HHLL_PERIOD).max()
     out["LL20"] = out["low"].rolling(HHLL_PERIOD).min()
     span = out["HH20"] - out["LL20"]
     out["Range_Pos20"] = (out["close"] - out["LL20"]) / span * 100
     out.loc[(span == 0) | span.isna(), "Range_Pos20"] = 0.0
-
     # RSI
     delta = out["close"].diff()
     gain = delta.clip(lower=0)
@@ -240,7 +239,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["RSI"] = 100 - (100 / (1 + rs))
     out.loc[avg_loss == 0, "RSI"] = 100
     out.loc[(avg_gain == 0) & (avg_loss > 0), "RSI"] = 0
-
     # ATR
     prev_close = out["close"].shift(1)
     tr_components = pd.concat([
@@ -250,27 +248,22 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1)
     tr = tr_components.max(axis=1)
     out["ATR"] = tr.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()
-
     # MACD
     ema_fast = out["close"].ewm(span=MACD_FAST, adjust=False).mean()
     ema_slow = out["close"].ewm(span=MACD_SLOW, adjust=False).mean()
     out["MACD"] = ema_fast - ema_slow
     out["MACD_Signal"] = out["MACD"].ewm(span=MACD_SIGNAL, adjust=False).mean()
     out["MACD_Hist"] = out["MACD"] - out["MACD_Signal"]
-
     # Trend10 (문자열 패턴)
     out = _add_trend10_for_collector(out, window=10)
-
     # NaN/inf 정리
     out.replace([np.inf, -np.inf], np.nan, inplace=True)
-
     # 숫자 컬럼과 문자열 컬럼 분리
     core_numeric_cols = [
         "close", "BB_Pos", "BandWidth", "Range_Pos20",
         "RSI", "ATR", "MACD", "MACD_Signal", "MACD_Hist"
     ]
     core_non_numeric_cols = ["Trend10"]  # 필요 시 추가
-
     # 존재하는 숫자 컬럼만 선택
     exist_num = [c for c in core_numeric_cols if c in out.columns]
     if exist_num:
@@ -280,13 +273,11 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
             # to_numeric로 강제 변환 (errors='coerce'로 안전하게 NaN 처리)
             out[c] = pd.to_numeric(out[c], errors='coerce')
         out[exist_num] = out[exist_num].fillna(0.0)
-
     # 비숫자 컬럼은 건드리지 않거나 필요 시 결측치 None 처리
     for c in core_non_numeric_cols:
         if c in out.columns:
             # 패턴이 아직 생성 안된 구간은 그대로 None 유지
             out[c] = out[c].where(out[c].notna(), None)
-
     return out
 
 def _add_trend10_for_collector(df: pd.DataFrame, window: int = 10, doji_char: str = "-") -> pd.DataFrame:
@@ -347,7 +338,6 @@ async def collect_bb_for_timeframe(client: httpx.AsyncClient, markets: list, uni
             continue
         df_ind = compute_indicators(df)
         last = df_ind.iloc[-1]
-
         record = {
             "market": market,
             "close": _sanitize_value(last.get("close")),
@@ -441,12 +431,54 @@ async def get_trendcoins():
         print(f"get_trendcoins: 요청 실패 - {e}")
         return []
 
+cross_memory = {}  # 전역 (최초 1회)
+
+RL_RE = re.compile(r"group=(\w+); *min=(\d+); *sec=(\d+)")
+
+def parse_remaining_req(header_value: str):
+    if not header_value:
+        return None
+    m = RL_RE.search(header_value)
+    if not m:
+        return None
+    group, min_cnt, sec_cnt = m.groups()
+    return {"group": group, "min": int(min_cnt), "sec": int(sec_cnt)}
+
+def polite_get(url, max_retry=8, base_sleep=0.12, jitter=0.05):
+    for attempt in range(1, max_retry+1):
+        resp = requests.get(url)
+        rem_header = resp.headers.get("Remaining-Req")
+        rem = parse_remaining_req(rem_header)
+
+        if resp.status_code == 200:
+            # 남은 초당 호출량이 1 이하이면 잠깐 쉬어 버스트 방지
+            if rem and rem["sec"] <= 1:
+                time.sleep(0.25 + random.uniform(0, 0.05))
+            return resp
+
+        if resp.status_code == 429:
+            ra = resp.headers.get("Retry-After")
+            if ra:
+                wait = float(ra)
+            else:
+                wait = min(2.0, base_sleep * (2 ** (attempt - 1)) + random.uniform(0, jitter))
+                if rem and rem["sec"] == 0:
+                    wait = max(wait, 0.6)
+            print(f"[WARN] 429 too_many_requests attempt={attempt} waiting {wait:.3f}s rem={rem}")
+            time.sleep(wait)
+            continue
+
+        # 기타 오류
+        resp.raise_for_status()
+
+    raise RuntimeError("429 재시도 초과")
+
 async def peak_trade(
-        ticker='KRW-BTC',
-        short_window=3,
-        long_window=20,
-        count=180,
-        candle_unit='1h'
+    ticker='KRW-BTC',
+    short_window=3,
+    long_window=20,
+    count=180,
+    candle_unit='1h'
 ):
     candle_map = {
         '1d': ('days', ''),
@@ -459,84 +491,127 @@ async def peak_trade(
         '3m': ('minutes', 3),
         '1m': ('minutes', 1),
     }
-    global cross_memory
     if candle_unit not in candle_map:
         raise ValueError(f"지원하지 않는 단위: {candle_unit}")
     api_type, minute = candle_map[candle_unit]
+
     if api_type == 'days':
         url = f'https://api.upbit.com/v1/candles/days?market={ticker}&count={count}'
     else:
         url = f'https://api.upbit.com/v1/candles/minutes/{minute}?market={ticker}&count={count}'
-    response = requests.get(url)
-    data = response.json()
-    df = pd.DataFrame(data)
-    if 'candle_date_time_utc' in df.columns:
-        idx = pd.to_datetime(df['candle_date_time_utc'], format='%Y-%m-%dT%H:%M:%S', utc=True).dt.tz_convert('Asia/Seoul')
-        df.set_index(idx, inplace=True)
-        df.index.name = 'candle_time_kst'
-    else:
-        idx = pd.to_datetime(df['candle_date_time_kst'], format='%Y-%m-%dT%H:%M:%S').tz_localize('Asia/Seoul')
-        df.set_index(idx, inplace=True)
-        df.index.name = 'candle_time_kst'
-    df = df.sort_index(ascending=True)
-    df['VWMA_3'] = (
-        (df['trade_price'] * df['candle_acc_trade_volume']).rolling(window=3).sum() /
-        df['candle_acc_trade_volume'].rolling(window=3).sum()
-    )
-    df['VWMA_20'] = (
-        (df['trade_price'] * df['candle_acc_trade_volume']).rolling(window=20).sum() /
-        df['candle_acc_trade_volume'].rolling(window=20).sum()
-    )
-    df['vwma_diff'] = df['VWMA_3'] - df['VWMA_20']
-    golden_cross = df[(df['vwma_diff'].shift(1) < 0) & (df['vwma_diff'] > 0)].copy()
-    golden_cross['cross_type'] = 'golden'
-    dead_cross = df[(df['vwma_diff'].shift(1) > 0) & (df['vwma_diff'] < 0)].copy()
-    dead_cross['cross_type'] = 'dead'
-    crosses = pd.concat([golden_cross, dead_cross]).sort_index()
-    last_2 = crosses.tail(2)
-    if last_2.empty:
+
+    resp = polite_get(url)
+    try:
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError(f"JSON 파싱 실패 status={resp.status_code} text={resp.text[:200]}")
+
+    if isinstance(data, dict) and 'error' in data:
+        raise RuntimeError(f"Upbit API 오류: {data['error']}")
+
+    if not isinstance(data, list):
+        raise RuntimeError(f"예상치 못한 응답 타입: {type(data)} {str(data)[:200]}")
+
+    if len(data) == 0:
+        cross_memory[ticker] = {'error': '빈 데이터', 'ticker': ticker}
         return
-    latest_cross_time = last_2.index[-1]
+
+    df = pd.DataFrame(data)
+
+    if 'candle_date_time_utc' not in df.columns:
+        raise RuntimeError(f"필수 컬럼 없음 columns={list(df.columns)}")
+
+    idx = (
+        pd.to_datetime(df['candle_date_time_utc'], format='%Y-%m-%dT%H:%M:%S', utc=True)
+        .dt.tz_convert('Asia/Seoul')
+    )
+    df.index = idx
+    df.index.name = 'candle_time_kst'
+    df = df.sort_index()
+
+    # 최소 롤링 길이 확보
+    need_len = max(short_window, long_window)
+    if len(df) < need_len:
+        cross_memory[ticker] = {
+            'error': '데이터 길이 부족',
+            'len': len(df),
+            'need': need_len
+        }
+        return
+
+    sw_col = f'VWMA_{short_window}'
+    lw_col = f'VWMA_{long_window}'
+
+    df[sw_col] = (
+        (df['trade_price'] * df['candle_acc_trade_volume']).rolling(window=short_window).sum()
+        / df['candle_acc_trade_volume'].rolling(window=short_window).sum()
+    )
+    df[lw_col] = (
+        (df['trade_price'] * df['candle_acc_trade_volume']).rolling(window=long_window).sum()
+        / df['candle_acc_trade_volume'].rolling(window=long_window).sum()
+    )
+
+    df['vwma_diff'] = df[sw_col] - df[lw_col]
+    valid = df.dropna(subset=['vwma_diff'])
+    if valid.empty:
+        cross_memory[ticker] = {'error': 'VWMA NaN 지속', 'ticker': ticker}
+        return
+
+    golden = valid[(valid['vwma_diff'].shift(1) < 0) & (valid['vwma_diff'] > 0)].copy()
+    golden['cross_type'] = 'golden'
+    dead = valid[(valid['vwma_diff'].shift(1) > 0) & (valid['vwma_diff'] < 0)].copy()
+    dead['cross_type'] = 'dead'
+
+    crosses = pd.concat([golden, dead]).sort_index()
+    last_2 = crosses.tail(2)
+
     now = pd.Timestamp.now(tz='Asia/Seoul')
+    if last_2.empty:
+        cross_memory[ticker] = {
+            'last_2_crosses': [],
+            'latest_cross_type': None,
+            'note': '교차 없음',
+            'updated': now
+        }
+        return
+
+    latest_cross_time = last_2.index[-1]
     elapsed = now - latest_cross_time
 
-    if len(df) >= 6:
-        vwma3_dir = 'UP' if df['VWMA_3'].iloc[-1] > df['VWMA_3'].iloc[-2] else 'DN'
-        vwma20_dir = 'UP' if df['VWMA_20'].iloc[-1] > df['VWMA_20'].iloc[-2] else 'DN'
-        vwma3_slope = df['VWMA_3'].iloc[-1] - df['VWMA_3'].iloc[-2]
-        vwma20_now = df['VWMA_20'].iloc[-1]
-        vwma20_mean = df['VWMA_20'].iloc[-6:].mean()
-        vwma20_slope = vwma20_now - vwma20_mean
-        vwma20_angle = np.degrees(np.arctan(vwma20_slope))
-        volume_slope = df['candle_acc_trade_volume'].iloc[-1] - df['candle_acc_trade_volume'].iloc[-2]
-        vwma3_angle = np.degrees(np.arctan(vwma3_slope))
-        volume_angle = np.degrees(np.arctan(volume_slope))
+    if len(df) >= 6 and not df[sw_col].iloc[-2:].isna().any():
+        sw_dir = 'UP' if df[sw_col].iloc[-1] > df[sw_col].iloc[-2] else 'DN'
+        lw_dir = 'UP' if df[lw_col].iloc[-1] > df[lw_col].iloc[-2] else 'DN'
+        sw_slope = df[sw_col].iloc[-1] - df[sw_col].iloc[-2]
+        lw_now = df[lw_col].iloc[-1]
+        lw_mean6 = df[lw_col].iloc[-6:].mean()
+        lw_slope = lw_now - lw_mean6
+        sw_angle = np.degrees(np.arctan(sw_slope))
+        lw_angle = np.degrees(np.arctan(lw_slope))
+        vol_slope = df['candle_acc_trade_volume'].iloc[-1] - df['candle_acc_trade_volume'].iloc[-2]
+        vol_angle = np.degrees(np.arctan(vol_slope))
     else:
-        vwma20_slope = vwma20_angle = None
-        vwma3_dir = vwma20_dir = 'N/A'
-        vwma3_slope = vwma20_slope = volume_slope = None
-        vwma3_angle = volume_angle = None
+        sw_dir = lw_dir = 'N/A'
+        sw_angle = lw_angle = vol_angle = None
 
     cross_memory[ticker] = {
         'last_2_crosses': [
-            {
-                'type': row['cross_type'],
-                'time': idx
-            } for idx, row in last_2.iterrows()
+            {'type': r['cross_type'], 'time': t}
+            for t, r in last_2.iterrows()
         ],
         'latest_cross_type': last_2.iloc[-1]['cross_type'],
         'latest_cross_time': latest_cross_time,
         'now': now,
-            'elapsed': elapsed,
-        'VWMA_3': df['VWMA_3'].iloc[-1],
-        'VWMA_20': df['VWMA_20'].iloc[-1],
-        'VWMA_3_dir': vwma3_dir,
-        'VWMA_20_dir': vwma20_dir,
-        'VWMA_3_angle': vwma3_angle,
-        'VWMA_20_angle': vwma20_angle,
+        'elapsed': elapsed,
+        sw_col: df[sw_col].iloc[-1],
+        lw_col: df[lw_col].iloc[-1],
+        f'{sw_col}_dir': sw_dir,
+        f'{lw_col}_dir': lw_dir,
+        f'{sw_col}_angle': sw_angle,
+        f'{lw_col}_angle': lw_angle,
         'volume': df['candle_acc_trade_volume'].iloc[-1],
-        'volume_angle': volume_angle
+        'volume_angle': vol_angle
     }
+
 
 async def trend_loop():
     while True:
@@ -550,7 +625,7 @@ async def trend_loop():
             except Exception as e:
                 print(f"peak_trade 실패({coin}): {e}")
             await asyncio.sleep(0.5)
-        await asyncio.sleep(60)
+        await asyncio.sleep(15)
 
 # ===============================================================================================
 # 가격 조회
@@ -727,7 +802,7 @@ async def get_top30coins():
         if not market_data:
             continue
         bid30 = round(sum(list(market_data['BID'])[-30:]), 0)
-        if bid30 > 10_000_000:
+        if bid30 > 5_000_000:
             result.append(market)
     result.sort(key=lambda m: trade_counts.get(m, 0), reverse=True)
     top30 = result[:30]
