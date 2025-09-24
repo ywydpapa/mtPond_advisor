@@ -350,6 +350,7 @@ async def collect_bb_for_timeframe(client: httpx.AsyncClient, markets: list, uni
             "MACD_Signal": _sanitize_value(last.get("MACD_Signal")),
             "MACD_Hist": _sanitize_value(last.get("MACD_Hist")),
             "Trend10": last.get("Trend10", None),
+            "volume": _sanitize_value(last.get("volume", None)),
             "time": last.name.isoformat()
         }
         # 혹시 남은 NaN/inf 정리 (미방어 컬럼 대비)
