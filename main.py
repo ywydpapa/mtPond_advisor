@@ -59,7 +59,7 @@ app.add_middleware(
 )
 
 # ========================== 다중 타임프레임 Bollinger Collector 설정 ==========================
-TOP30_ENDPOINT = os.getenv("TOP30_ENDPOINT", "http://127.0.0.1:8000/api/top30coins")
+TOP30_ENDPOINT = os.getenv("TOP30_ENDPOINT", "http://127.0.0.1:8008/api/top30coins")
 
 BB_TIMEFRAMES = [3, 5, 15, 30]   # 분 단위
 BB_CANDLE_COUNT = 200
@@ -413,7 +413,7 @@ def start_bb_collector_once():
 # VWMA 크로스 관련 (trend_loop)
 # ===============================================================================================
 async def get_trendcoins():
-    url = 'http://ywydpapa.iptime.org:8000/api/top30coins'
+    url = 'http://127.0.0.1:8008/api/top30coins'
     def fetch():
         s = requests.Session()
         s.trust_env = False
