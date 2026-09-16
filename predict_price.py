@@ -143,7 +143,7 @@ async def peak_trade(
     # print(f"거래량 기울기: {volume_angle:.2f}")
 
 async def get_trendcoins():
-    url = 'http://ywydpapa.iptime.org:8000/api/top30coins'
+    url = 'http://hitoff.iptime.org/api/top30coins'
     response = requests.get(url)
     data = response.json()
     coins = data['markets']
