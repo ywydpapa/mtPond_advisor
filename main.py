@@ -18,8 +18,9 @@ from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-
-from typing import List
+import numpy as np
+import pandas as pd
+from typing import List, Optional
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -154,6 +155,120 @@ async def reset_trade_counts():
         for market in list(trade_counts.keys()):
             trade_counts[market] = 0
 
+
+import numpy as np
+import pandas as pd
+
+def calculate_advanced_signals(df: pd.DataFrame, bb_period: int = 20, bb_std: float = 2.0, rsi_period: int = 14, atr_period: int = 14) -> dict:
+    """
+    볼린저 밴드 + 거래량 폭증 + RSI 다이버전스 + ATR 손익비를 결합한 정밀 신호 계산
+    """
+    if len(df) < max(bb_period, rsi_period, atr_period) + 10:
+        return None
+
+    close = df['trade_price']
+    high = df['high_price']
+    low = df['low_price']
+    vol = df['candle_acc_trade_volume']
+
+    # 1. 볼린저 밴드 계산
+    ma = close.rolling(bb_period).mean()
+    std = close.rolling(bb_period).std(ddof=0)
+    upper = ma + (std * bb_std)
+    lower = ma - (std * bb_std)
+    pct_b = (close - lower) / (upper - lower).replace(0, np.nan)
+    band_width = (upper - lower) / ma.replace(0, np.nan)
+
+    # 2. 거래량 폭증 여부 (직전 20봉 평균 거래량 대비 200% 이상)
+    vol_ma20 = vol.rolling(20).mean()
+    curr_vol = vol.iloc[-1]
+    prev_vol_avg = vol_ma20.iloc[-2]
+    volume_ratio = (curr_vol / prev_vol_avg) if prev_vol_avg > 0 else 1.0
+    is_volume_spike = volume_ratio >= 2.0
+
+    # 3. RSI 계산
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / rsi_period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / rsi_period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+
+    # 4. RSI 약세 다이버전스 감지 (최근 15봉 내 고가 갱신 vs RSI 하락)
+    # 조건: 현재 가격이 최근 15봉 최고가 부근이지만, RSI 고점은 이전보다 낮아진 경우
+    recent_high_idx = high.tail(15).idxmax()
+    curr_idx = df.index[-1]
+    is_bearish_div = False
+
+    if high.iloc[-1] >= high.tail(15).max() * 0.99:  # 신고가 트라이 중
+        prev_rsi_peak = rsi.tail(15).iloc[:-2].max()
+        if rsi.iloc[-1] < prev_rsi_peak - 3.0:      # RSI 고점은 명확히 하락
+            is_bearish_div = True
+
+    # 5. ATR 계산 및 손익비(Risk/Reward Ratio) 산정
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / atr_period, adjust=False).mean()
+
+    curr_close = close.iloc[-1]
+    curr_upper = upper.iloc[-1]
+    curr_atr = atr.iloc[-1]
+
+    # 익절 목표가(TP): 상단 밴드 / 손절가(SL): 현재가 - (1.5 * ATR)
+    expected_profit = max(0.0, curr_upper - curr_close)
+    expected_risk = max(curr_close * 0.005, curr_atr * 1.5)  # 최소 0.5% 기본 슬리피지 방어
+    rr_ratio = expected_profit / expected_risk if expected_risk > 0 else 0.0
+
+    # 6. 진입 시그널 필터링 판정
+    c_now, c_prev = close.iloc[-1], close.iloc[-2]
+    pb_now, pb_prev = pct_b.iloc[-1], pct_b.iloc[-2]
+    min_bw_20 = band_width.tail(20).min()
+    is_squeeze = band_width.iloc[-1] <= (min_bw_20 * 1.15)
+    bw_expanding = band_width.iloc[-1] > band_width.iloc[-2]
+
+    signal_status = "HOLD"
+    reasons = []
+
+    # [매수 조건 1] 스퀴즈 탈출 상단 돌파 (거래량 폭증 필수)
+    if is_squeeze and bw_expanding and (pb_now >= 0.8):
+        if is_volume_spike and not is_bearish_div:
+            signal_status = "STRONG_BUY"
+            reasons.append("스퀴즈 탈출 + 거래량 폭증")
+        elif not is_volume_spike:
+            reasons.append("가짜 돌파 의심 (거래량 부족)")
+
+    # [매수 조건 2] 하단 지지 후 중심선 상향 돌파 (손익비 충족 필수)
+    elif pb_prev < 0.5 and pb_now >= 0.5:
+        if not is_bearish_div:
+            if rr_ratio >= 1.5:
+                signal_status = "BUY"
+                reasons.append(f"중심선 돌파 (손익비 {rr_ratio:.2f})")
+            else:
+                reasons.append(f"손익비 미달 ({rr_ratio:.2f} < 1.5)")
+
+    # [탈락 조건] 상단 근처이나 RSI 약세 다이버전스 출현
+    if is_bearish_div and pb_now >= 0.8:
+        signal_status = "WARNING_SELL"
+        reasons.append("RSI 약세 다이버전스 (고점 이탈 주의)")
+
+    return {
+        "price": curr_close,
+        "pct_b": round(float(pb_now) * 100, 1),
+        "volume_ratio": round(float(volume_ratio) * 100, 1),  # %
+        "is_vol_spike": is_volume_spike,
+        "is_bearish_div": is_bearish_div,
+        "atr": round(float(curr_atr), 2),
+        "rr_ratio": round(float(rr_ratio), 2),
+        "signal": signal_status,
+        "reason": ", ".join(reasons) if reasons else "특이 패턴 없음"
+    }
+
+
 # ===============================================================================================
 # Top30 외부(내부 API) 기반 수집 함수
 # ===============================================================================================
@@ -197,6 +312,49 @@ async def fetch_candles_async(client: httpx.AsyncClient, market: str, unit: int,
     df["dt"] = pd.to_datetime(df["dt"])
     df.set_index("dt", inplace=True)
     return df
+
+def evaluate_coin_recommendation(market: str, tf_results: dict) -> dict:
+    """
+    1d, 4h, 1h, 30m, 10m 결과를 종합하여 최종 추천 여부 결정
+    """
+    daily = tf_results.get("1d")
+    h4 = tf_results.get("4h")
+    m30 = tf_results.get("30m")
+    m10 = tf_results.get("10m")
+
+    if not (daily and h4 and m30 and m10):
+        return None
+
+    # 규칙 1: 상위 타임프레임 필터 (일봉 또는 4시간봉이 최소 20MA 중심선 이상, 역배열 코인 차단)
+    if daily["pct_b"] < 40.0 and h4["pct_b"] < 40.0:
+        return None  # 하락 추세 코인 전면 배제
+
+    # 규칙 2: RSI 다이버전스 필터 (단기 봉에서 약세 다이버전스가 떴다면 즉시 제외)
+    if m10["is_bearish_div"] or m30["is_bearish_div"]:
+        return None
+
+    # 규칙 3: 단기 봉(30m 또는 10m)에서 명확한 진입 시그널 발생 여부
+    trigger_tf = m30 if m30["signal"] in ("BUY", "STRONG_BUY") else (m10 if m10["signal"] in ("BUY", "STRONG_BUY") else None)
+    if not trigger_tf:
+        return None
+
+    # 규칙 4: 손익비(Risk/Reward) 최종 확인
+    if trigger_tf["rr_ratio"] < 1.5:
+        return None
+
+    # 최종 점수 산출 (거래량 배수 + 손익비 가중치)
+    score = (trigger_tf["volume_ratio"] / 100.0) * 2.0 + trigger_tf["rr_ratio"]
+
+    return {
+        "market": market,
+        "current_price": trigger_tf["price"],
+        "recommend_type": trigger_tf["signal"],
+        "trigger_timeframe": "30m" if trigger_tf == m30 else "10m",
+        "volume_surge": f"{trigger_tf['volume_ratio']}%",
+        "rr_ratio": f"1:{trigger_tf['rr_ratio']}",
+        "reason": trigger_tf["reason"],
+        "priority_score": round(score, 2)
+    }
 
 # --- (기존 전체 코드 중 compute_indicators 함수만 교체하는 패치) ---
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -1035,79 +1193,6 @@ async def rest_predict(dateTag, coinName, avgUprate, avgDownrate, currentPrice,
         print("Error!!", e)
         return False
 
-# ===============================================================================================
-# [추가] 볼린저 밴드 멀티 타임프레임 트렌드 조회 API
-# ===============================================================================================
-@app.get("/api/bb-patterns")
-async def get_bb_patterns(limit: int = 50, min_score: int = None):
-    """
-    10분마다 계산된 전체 코인의 멀티 타임프레임(10m, 30m, 1h, 4h, 1d) 분석 결과 조회
-    - limit: 반환할 상위 코인 수 (기본 50)
-    - min_score: 필터링할 최소 종합 상승 점수
-    """
-    if bb_pattern_cache["status"] == "initial":
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "processing",
-                "message": "서버 시작 후 최초 수집 작업이 진행 중입니다. 잠시 후 다시 호출해 주세요."
-            }
-        )
-
-    data = bb_pattern_cache["data"]
-    if min_score is not None:
-        data = [item for item in data if item["overall_score"] >= min_score]
-
-    return {
-        "status": bb_pattern_cache["status"],
-        "updated": bb_pattern_cache["updated"],
-        "total_analyzed": bb_pattern_cache["total_markets"],
-        "result_count": len(data[:limit]),
-        "coins": data[:limit]
-    }
-
-
-@app.get("/bb-patterns", response_class=HTMLResponse)
-async def aiget_bb_patterns(
-    request: Request,
-    limit: int = 150,           # 기본값을 넉넉하게 설정하여 전체 코인 표시
-    min_score: int = None
-):
-    # 1. 초기 수집 중일 때 대기 안내 화면 렌더링
-    if bb_pattern_cache["status"] == "initial":
-        return templates.TemplateResponse(
-            "bb_patterns.html",
-            {
-                "request": request,
-                "status": "initial",
-                "message": "서버 시작 후 최초 수집 작업이 진행 중입니다. 잠시 후 새로고침해 주세요.",
-                "coins": [],
-                "updated": None
-            }
-        )
-
-    data = bb_pattern_cache.get("data", [])
-
-    # 2. 필터링 처리
-    if min_score is not None:
-        data = [item for item in data if item.get("overall_score", 0) >= min_score]
-
-    coins_to_render = data[:limit] if limit is not None else data
-
-    # 3. 템플릿 렌더링
-    return templates.TemplateResponse(
-        "bb_patterns.html",
-        {
-            "request": request,
-            "status": bb_pattern_cache.get("status"),
-            "updated": bb_pattern_cache.get("updated"),
-            "total_analyzed": bb_pattern_cache.get("total_markets", 0),
-            "coins": coins_to_render,
-            "min_score": min_score,
-            "limit": limit
-        }
-    )
-
 @app.post("/api/bb-patterns/force-update")
 async def force_bb_patterns_update():
     """
@@ -1173,20 +1258,29 @@ async def fetch_pattern_candles_async(client: httpx.AsyncClient, market: str, ca
 
 
 # ===============================================================================================
-# [추가] 단일 캔들프레임 동적 패턴 및 변동폭 계산 엔진
+# [교체] 단일 캔들프레임 고급 동적 패턴 & 보조지표(Volume, RSI Div, ATR RR) 계산 엔진
 # ===============================================================================================
-def analyze_tf_pattern(df: pd.DataFrame, bb_period: int = 20, bb_std: float = 2.0) -> dict:
-    if len(df) < bb_period:
+def analyze_tf_pattern(
+    df: pd.DataFrame,
+    bb_period: int = 20,
+    bb_std: float = 2.0,
+    rsi_period: int = 14,
+    atr_period: int = 14
+) -> dict:
+    if len(df) < max(bb_period, rsi_period, atr_period) + 10:
         return None
 
     close = df['trade_price']
+    high = df['high_price']
+    low = df['low_price']
+    vol = df['candle_acc_trade_volume']
+
+    # 1. 볼린저 밴드 계산
     ma = close.rolling(window=bb_period).mean()
     std = close.rolling(window=bb_period).std(ddof=0)
-
     upper = ma + (std * bb_std)
     lower = ma - (std * bb_std)
 
-    # 0 분모 방어
     band_denom = (upper - lower).replace(0, np.nan)
     pct_b = (close - lower) / band_denom
     band_width = (upper - lower) / ma.replace(0, np.nan)
@@ -1198,15 +1292,57 @@ def analyze_tf_pattern(df: pd.DataFrame, bb_period: int = 20, bb_std: float = 2.
     ma_now, ma_prev = ma.iloc[-1], ma.iloc[-2]
     bw_now = band_width.iloc[-1]
 
-    # 스퀴즈 및 확장 여부 (최근 20봉 최저폭 기준)
+    # 스퀴즈 및 밴드 확장 여부
     min_bw_20 = band_width.tail(20).min()
     is_squeeze = (bw_now <= (min_bw_20 * 1.15)) if pd.notna(min_bw_20) else False
     bw_expanding = (bw_now > band_width.iloc[-2]) if pd.notna(bw_now) else False
 
-    # 패턴 판별
+    # 2. 거래량 폭증 여부 (직전 20봉 평균 대비 200% 이상)
+    vol_ma20 = vol.rolling(20).mean()
+    curr_vol = vol.iloc[-1]
+    prev_vol_avg = vol_ma20.iloc[-2]
+    volume_ratio = (curr_vol / prev_vol_avg) if prev_vol_avg > 0 else 1.0
+    is_volume_spike = bool(volume_ratio >= 2.0)
+
+    # 3. RSI 계산
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / rsi_period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / rsi_period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+
+    # 4. RSI 약세 다이버전스 감지 (최근 15봉 신고가 트라이 중 RSI 하락)
+    is_bearish_div = False
+    if high.iloc[-1] >= high.tail(15).max() * 0.99:
+        prev_rsi_peak = rsi.tail(15).iloc[:-2].max()
+        if pd.notna(prev_rsi_peak) and (rsi.iloc[-1] < prev_rsi_peak - 3.0):
+            is_bearish_div = True
+
+    # 5. ATR 및 손익비(Risk/Reward Ratio) 산정
+    prev_close_s = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close_s).abs(),
+        (low - prev_close_s).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / atr_period, adjust=False).mean()
+
+    curr_close = close.iloc[-1]
+    curr_upper = upper.iloc[-1]
+    curr_atr = atr.iloc[-1] if pd.notna(atr.iloc[-1]) else 0.0
+
+    expected_profit = max(0.0, curr_upper - curr_close)
+    expected_risk = max(curr_close * 0.005, curr_atr * 1.5)
+    rr_ratio = expected_profit / expected_risk if expected_risk > 0 else 0.0
+
+    # 6. 기본 패턴 및 종합 점수 판별
     pattern = "횡보 / 방향 탐색"
     bias = "중립"
-    score = 0  # 상승 점수(+), 하락 점수(-)
+    score = 0
+    signal_status = "HOLD"
+    reasons = []
 
     if pb_now >= 0.85 and pb_prev >= 0.85 and ma_now > ma_prev:
         pattern = "상승 밴드 라이딩"
@@ -1237,22 +1373,49 @@ def analyze_tf_pattern(df: pd.DataFrame, bb_period: int = 20, bb_std: float = 2.
         bias = "하락 추세 지속"
         score = -3
 
-    # 변동폭 계산 (최근 14봉 평균 변동률 %)
-    candle_ranges = df['high_price'] - df['low_price']
+    # 7. 보조지표 결합 정밀 신호(Signal) 판정
+    if is_squeeze and bw_expanding and (pb_now >= 0.8):
+        if is_volume_spike and not is_bearish_div:
+            signal_status = "STRONG_BUY"
+            reasons.append("스퀴즈 탈출 + 거래량 폭증")
+        elif not is_volume_spike:
+            reasons.append("가짜 돌파 의심 (거래량 부족)")
+    elif pb_prev < 0.5 and pb_now >= 0.5:
+        if not is_bearish_div:
+            if rr_ratio >= 1.5:
+                signal_status = "BUY"
+                reasons.append(f"중심선 돌파 (손익비 {rr_ratio:.2f})")
+            else:
+                reasons.append(f"손익비 미달 ({rr_ratio:.2f} < 1.5)")
+
+    if is_bearish_div and pb_now >= 0.8:
+        signal_status = "WARNING_SELL"
+        reasons.append("RSI 약세 다이버전스 (고점 이탈 주의)")
+
+    candle_ranges = high - low
     avg_volatility_pct = (candle_ranges / df['opening_price'] * 100).tail(14).mean()
 
     return {
+        "price": curr_close,
         "pct_b": round(float(pb_now) * 100, 1) if pd.notna(pb_now) else 50.0,
         "pattern": pattern,
         "bias": bias,
         "score": score,
         "bandwidth_expanding": bool(bw_expanding),
-        "expected_volatility_pct": round(float(avg_volatility_pct), 2) if pd.notna(avg_volatility_pct) else 0.0
+        "expected_volatility_pct": round(float(avg_volatility_pct), 2) if pd.notna(avg_volatility_pct) else 0.0,
+        # 신규 보조지표 결과
+        "volume_ratio": round(float(volume_ratio) * 100, 1),
+        "is_vol_spike": is_volume_spike,
+        "is_bearish_div": is_bearish_div,
+        "atr": round(float(curr_atr), 2),
+        "rr_ratio": round(float(rr_ratio), 2),
+        "signal": signal_status,
+        "reason": ", ".join(reasons) if reasons else "특이 패턴 없음"
     }
 
 
 # ===============================================================================================
-# [추가] 단일 코인 전체 타임프레임 수집 처리
+# [교체] 단일 코인 전체 타임프레임 수집 및 추천 평가 파이프라인
 # ===============================================================================================
 async def analyze_single_market(client: httpx.AsyncClient, market: str, sem: asyncio.Semaphore) -> dict:
     tf_data = {}
@@ -1264,7 +1427,6 @@ async def analyze_single_market(client: httpx.AsyncClient, market: str, sem: asy
             df = await fetch_pattern_candles_async(
                 client, market, candle_type=tf["type"], count=60, unit=tf["unit"]
             )
-            # 업비트 호출 레이트 리밋 분산 대기
             await asyncio.sleep(0.08)
 
         if not df.empty:
@@ -1273,23 +1435,26 @@ async def analyze_single_market(client: httpx.AsyncClient, market: str, sem: asy
             res = analyze_tf_pattern(df)
             if res:
                 tf_data[tf["key"]] = res
-                # 일봉/4시간봉은 큰 추세이므로 가중치 적용
                 weight = 2 if tf["key"] in ("1d", "4h") else 1
                 total_score += res["score"] * weight
 
     if not tf_data:
         return None
 
+    # 보조지표 결합 4개 조건 기반 최종 추천 판정
+    recommendation = evaluate_coin_recommendation(market, tf_data)
+
     return {
         "market": market,
         "price": current_price,
-        "overall_score": total_score,  # 점수가 높을수록 다중 봉에서 상승 신호 일치
+        "overall_score": total_score,
+        "recommendation": recommendation,  # None 이거나 추천 딕셔너리
         "timeframes": tf_data
     }
 
 
 # ===============================================================================================
-# [추가] 10분 백그라운드 수집 워커
+# [교체] 10분 백그라운드 수집 워커 (우선순위 정렬 반영)
 # ===============================================================================================
 async def run_market_pattern_collector_once():
     global bb_pattern_cache
@@ -1300,7 +1465,6 @@ async def run_market_pattern_collector_once():
     all_results = []
 
     async with httpx.AsyncClient(timeout=10) as client:
-        # 전체 KRW 마켓을 순회하며 지표 계산
         for market in krw_markets:
             try:
                 res = await analyze_single_market(client, market, sem)
@@ -1309,30 +1473,153 @@ async def run_market_pattern_collector_once():
             except Exception as e:
                 print(f"[bb_pattern] market {market} 분석 실패: {e}")
 
-    # 종합 점수가 높은 순으로 정렬 (상승 모멘텀 높은 코인 상위 정렬)
-    all_results.sort(key=lambda x: x["overall_score"], reverse=True)
+    # 1순위: 추천 통과 코인(priority_score 기준 내림차순), 2순위: overall_score 내림차순
+        # 방법 A (추천): 종합 점수(overall_score) 높은 순 정렬을 유지하되, 동점일 때 추천 코인 우선
+        all_results.sort(
+            key=lambda x: (
+                x["overall_score"],
+                1 if x.get("recommendation") else 0,
+                x["recommendation"]["priority_score"] if x.get("recommendation") else 0
+            ),
+            reverse=True
+        )
 
     async with _bb_pattern_lock:
         bb_pattern_cache = {
             "updated": _dt.utcnow().isoformat(),
             "status": "ok",
             "total_markets": len(all_results),
+            "recommended_count": len([x for x in all_results if x.get("recommendation")]),
             "data": all_results
         }
-    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] KRW {len(all_results)}개 코인 10분 다중타임프레임 분석 완료.")
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] KRW {len(all_results)}개 코인 분석 완료 (추천 통과: {bb_pattern_cache['recommended_count']}개)")
 
+
+# ===============================================================================================
+# [교체] REST API 엔드포인트 (추천 코인 전용 필터 파라미터 추가)
+# ===============================================================================================
+@app.get("/api/bb-patterns")
+async def get_bb_patterns(limit: int = 150, min_score: int = None, only_recommended: bool = False):
+    """
+    10분마다 계산된 전체 코인의 멀티 타임프레임 및 추천 목록 조회
+    - limit: 반환할 코인 수
+    - min_score: 필터링할 최소 종합 점수
+    - only_recommended: True일 경우 3단계 보조지표 검증을 통과한 추천 코인만 반환
+    """
+    if bb_pattern_cache["status"] == "initial":
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "processing",
+                "message": "서버 시작 후 최초 수집 작업이 진행 중입니다. 잠시 후 다시 호출해 주세요."
+            }
+        )
+
+    data = bb_pattern_cache["data"]
+
+    if only_recommended:
+        data = [item for item in data if item.get("recommendation") is not None]
+
+    if min_score is not None:
+        data = [item for item in data if item["overall_score"] >= min_score]
+
+    result_data = data[:limit] if limit is not None else data
+
+    return {
+        "status": bb_pattern_cache["status"],
+        "updated": bb_pattern_cache["updated"],
+        "total_analyzed": bb_pattern_cache["total_markets"],
+        "recommended_count": bb_pattern_cache.get("recommended_count", 0),
+        "result_count": len(result_data),
+        "coins": result_data
+    }
+
+@app.get("/bb-patterns", response_class=HTMLResponse)
+async def aiget_bb_patterns(
+    request: Request,
+    limit: Optional[int] = 150,
+    min_score: Optional[int] = None,
+    only_recommended: Optional[str] = "false"
+):
+    # 1. 초기 수집 중일 때 대기 화면 표시
+    if bb_pattern_cache["status"] == "initial":
+        return templates.TemplateResponse(
+            "bb_patterns.html",
+            {
+                "request": request,
+                "status": "initial",
+                "message": "서버 시작 후 최초 수집 작업이 진행 중입니다. 잠시 후 새로고침해 주세요.",
+                "coins": [],
+                "updated": None,
+                "total_analyzed": 0,
+                "recommended_count": 0,
+                "only_recommended": False
+            }
+        )
+
+    # 안전한 불리언 파싱
+    is_only_rec = str(only_recommended).strip().lower() in ("true", "1", "t", "y", "yes")
+
+    data = list(bb_pattern_cache.get("data", []))
+
+    # 추천 코인 필터링
+    if is_only_rec:
+        data = [
+            item for item in data
+            if item.get("recommendation") is not None and isinstance(item.get("recommendation"), dict)
+        ]
+
+    # 최소 종합 점수 필터링
+    if min_score is not None:
+        data = [item for item in data if item.get("overall_score", 0) >= min_score]
+
+    coins_to_render = data[:limit] if limit is not None else data
+
+    return templates.TemplateResponse(
+        "bb_patterns.html",
+        {
+            "request": request,
+            "status": bb_pattern_cache.get("status"),
+            "updated": bb_pattern_cache.get("updated"),
+            "total_analyzed": bb_pattern_cache.get("total_markets", 0),
+            "recommended_count": bb_pattern_cache.get("recommended_count", 0),
+            "coins": coins_to_render,
+            "min_score": min_score,
+            "limit": limit,
+            "only_recommended": is_only_rec
+        }
+    )
 
 async def bb_pattern_collector_loop():
-    # 서버 기동 후 웹소켓 및 초기 마켓 리스트 세팅을 위해 5초 대기
-    await asyncio.sleep(5)
+    await asyncio.sleep(5)  # 서버 기동 및 마켓 리스트 수신 대기
+
+    # 1. 서버 시작 후 최초 1회 즉시 수집 실행
+    try:
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 서버 기동 후 초기 수집을 시작합니다.")
+        await run_market_pattern_collector_once()
+    except Exception as e:
+        print(f"[bb_pattern_collector_loop Initial Error]: {e}")
+
+    # 2. 다음 10분 정각 스케줄링 무한 루프
     while True:
+        now = datetime.datetime.now()
+
+        # 다음 10분 단위 계산 (예: 14분 -> 20분, 53분 -> 다음 시간 00분)
+        minute_offset = 10 - (now.minute % 10)
+        target_time = (now + datetime.timedelta(minutes=minute_offset)).replace(
+            second=2, microsecond=0  # 캔들 마감 데이터 반영을 위해 정각 2초 뒤 실행
+        )
+
+        sleep_seconds = (target_time - now).total_seconds()
+
+        print(f"[{now.strftime('%H:%M:%S')}] 다음 수집 예정 시각: {target_time.strftime('%H:%M:%S')} (약 {int(sleep_seconds)}초 대기)")
+        await asyncio.sleep(sleep_seconds)
+
         try:
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 10분 정각 정기 수집을 시작합니다.")
             await run_market_pattern_collector_once()
         except Exception as e:
-            print(f"[bb_pattern_collector_loop] Error: {e}")
-
-        # 10분 대기 (BB_PATTERN_INTERVAL = 600)
-        await asyncio.sleep(BB_PATTERN_INTERVAL)
+            print(f"[bb_pattern_collector_loop Error]: {e}")
 
 
 @asynccontextmanager

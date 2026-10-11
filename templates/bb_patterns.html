@@ -38,6 +38,31 @@
         .header-panel h2 { margin: 0; font-size: 1.25rem; }
         .meta-text { color: var(--text-sub); font-size: 0.88rem; }
 
+        .btn-filter {
+            display: inline-block;
+            padding: 6px 14px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            border-radius: 6px;
+            text-decoration: none;
+            margin-left: 8px;
+            transition: all 0.2s;
+        }
+        .btn-active {
+            background-color: #ef4444;
+            color: #ffffff;
+            border: 1px solid #ef4444;
+        }
+        .btn-inactive {
+            background-color: #1e293b;
+            color: #94a3b8;
+            border: 1px solid #475569;
+        }
+        .btn-inactive:hover {
+            color: #ffffff;
+            border-color: #94a3b8;
+        }
+
         .table-container {
             overflow-x: auto;
             background: var(--card-bg);
@@ -70,6 +95,30 @@
             font-weight: 700;
             color: #38bdf8;
             text-align: left;
+            white-space: nowrap;
+        }
+
+        .recommend-tag {
+            display: inline-block;
+            background-color: rgba(239, 68, 68, 0.2);
+            border: 1px solid #ef4444;
+            color: #fca5a5;
+            font-size: 0.72rem;
+            font-weight: 700;
+            padding: 1px 6px;
+            border-radius: 4px;
+            margin-left: 6px;
+            vertical-align: middle;
+        }
+
+        .recommend-tag {
+            background-color: rgba(239, 68, 68, 0.2);
+            border: 1px solid #ef4444;
+            color: #fca5a5;
+            font-size: 0.72rem;
+            font-weight: 700;
+            padding: 1px 6px;
+            border-radius: 4px;
         }
 
         .score-pill {
@@ -82,6 +131,14 @@
         .score-high { background-color: rgba(239, 68, 68, 0.2); color: #f87171; }
         .score-mid { background-color: rgba(100, 116, 139, 0.2); color: #cbd5e1; }
         .score-low { background-color: rgba(59, 130, 246, 0.2); color: #60a5fa; }
+
+        .rec-info-box {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            align-items: center;
+            font-size: 0.76rem;
+        }
 
         .tf-box {
             display: flex;
@@ -114,19 +171,42 @@
     <div class="header-panel">
         <div>
             <h2>📊 볼린저밴드 멀티 타임프레임 추세 분석판</h2>
-            <div class="meta-text">
-                기준 주기: 10분, 30분, 1시간, 4시간, 1일 | 갱신 주기: 매 10분
+            <div class="meta-text" style="margin-top: 4px;">
+                기준 주기: 10분, 30분, 1시간, 4시간, 1일 | 갱신 주기: 매 10분 정각
             </div>
         </div>
-        <div style="text-align: right;">
-            <div class="meta-text">마지막 갱신: {{ updated if updated else '대기 중' }}</div>
-            <div class="meta-text">분석 코인: 총 {{ total_analyzed }}개</div>
+        <div style="display: flex; align-items: center; gap: 14px;">
+            <div style="text-align: right;">
+                <div class="meta-text">마지막 갱신: {{ updated if updated else '대기 중' }}</div>
+                <div class="meta-text">
+                    분석: {{ total_analyzed }}개 |
+                    <strong style="color: #f87171;">추천 통과: {{ recommended_count }}개</strong>
+                </div>
+            </div>
+            <div>
+                <a href="/bb-patterns" class="btn-filter {% if not only_recommended %}btn-active{% else %}btn-inactive{% endif %}">
+                    전체 보기
+                </a>
+                <a href="/bb-patterns?only_recommended=true" class="btn-filter {% if only_recommended %}btn-active{% else %}btn-inactive{% endif %}">
+                    🔥 추천 코인만
+                </a>
+            </div>
         </div>
     </div>
 
     {% if status == "initial" %}
         <div style="text-align: center; padding: 60px 0; background: var(--card-bg); border-radius: 8px;">
             <p style="font-size: 1.1rem; color: #fbbf24;">⏳ {{ message }}</p>
+        </div>
+    {% elif coins|length == 0 %}
+        <div style="text-align: center; padding: 60px 0; background: var(--card-bg); border-radius: 8px; border: 1px solid var(--border-color);">
+            <p style="font-size: 1.05rem; color: #94a3b8;">
+                {% if only_recommended %}
+                    현재 시점에 3단계 보조지표(거래량 폭증 + RSI 다이버전스 배제 + 손익비 1:1.5) 조건을 통과한 추천 코인이 없습니다.
+                {% else %}
+                    표시할 코인 데이터가 없습니다.
+                {% endif %}
+            </p>
         </div>
     {% else %}
         <div class="table-container">
@@ -136,6 +216,7 @@
                         <th style="text-align: left;">마켓</th>
                         <th>현재가</th>
                         <th>종합 점수</th>
+                        <th>진단 / 추천 요약</th>
                         <th>10분봉 (10m)</th>
                         <th>30분봉 (30m)</th>
                         <th>1시간봉 (1h)</th>
@@ -145,8 +226,15 @@
                 </thead>
                 <tbody>
                     {% for coin in coins %}
+                    {% set rec = coin.recommendation %}
                     <tr>
-                        <td class="market-badge">{{ coin.market }}</td>
+                        <td class="market-badge">
+                            <a href="https://upbit.com/exchange?code=CRIX.UPBIT.{{ coin.market }}" target="_blank" style="color: #38bdf8; text-decoration: none;">
+                                {{ coin.market }} </a>
+                        {% if rec %}
+                            <span class="recommend-tag">🔥 {{ rec.recommend_type }}</span>
+                        {% endif %}
+                        </td>
                         <td style="text-align: right; font-weight: 600;">
                             {% if coin.price >= 100 %}
                                 {{ "{:,.0f}".format(coin.price) }}원
@@ -163,7 +251,23 @@
                             </span>
                         </td>
 
-                        {# 타임프레임 반복 렌더링 #}
+                        {# 추천 지표 요약 컬럼 #}
+                        <td>
+                            {% if rec %}
+                                <div class="rec-info-box">
+                                    <span style="color: #f87171; font-weight: bold;">
+                                        [{{ rec.trigger_timeframe }}] {{ rec.reason }}
+                                    </span>
+                                    <span style="color: #94a3b8;">
+                                        거래량 {{ rec.volume_surge }} | 손익비 {{ rec.rr_ratio }}
+                                    </span>
+                                </div>
+                            {% else %}
+                                <span style="color: var(--text-sub);">-</span>
+                            {% endif %}
+                        </td>
+
+                        {# 각 타임프레임 반복 #}
                         {% for tf_key in ['10m', '30m', '1h', '4h', '1d'] %}
                             {% set tf = coin.timeframes.get(tf_key) %}
                             <td>
