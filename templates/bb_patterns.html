@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>코인 볼린저밴드 멀티 타임프레임 추세 분석</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --text-main: #f8fafc;
+            --text-sub: #94a3b8;
+            --border-color: #334155;
+            --up-color: #ef4444;
+            --down-color: #3b82f6;
+            --neutral-color: #64748b;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            margin: 0;
+            padding: 24px;
+        }
+
+        .header-panel {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: var(--card-bg);
+            padding: 16px 24px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border: 1px solid var(--border-color);
+        }
+
+        .header-panel h2 { margin: 0; font-size: 1.25rem; }
+        .meta-text { color: var(--text-sub); font-size: 0.88rem; }
+
+        .table-container {
+            overflow-x: auto;
+            background: var(--card-bg);
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+            text-align: center;
+            white-space: nowrap;
+        }
+
+        th, td {
+            padding: 10px 14px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        th {
+            background-color: #172033;
+            color: var(--text-sub);
+            font-weight: 600;
+        }
+
+        tr:hover { background-color: rgba(255, 255, 255, 0.03); }
+
+        .market-badge {
+            font-weight: 700;
+            color: #38bdf8;
+            text-align: left;
+        }
+
+        .score-pill {
+            display: inline-block;
+            font-weight: 700;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.82rem;
+        }
+        .score-high { background-color: rgba(239, 68, 68, 0.2); color: #f87171; }
+        .score-mid { background-color: rgba(100, 116, 139, 0.2); color: #cbd5e1; }
+        .score-low { background-color: rgba(59, 130, 246, 0.2); color: #60a5fa; }
+
+        .tf-box {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            align-items: center;
+        }
+
+        .pattern-text {
+            font-weight: 600;
+            font-size: 0.8rem;
+        }
+        .pattern-up { color: #f87171; }
+        .pattern-down { color: #60a5fa; }
+        .pattern-mid { color: #94a3b8; }
+
+        .tf-detail {
+            font-size: 0.75rem;
+            color: var(--text-sub);
+        }
+
+        .vol-tag {
+            color: #fbbf24;
+            font-size: 0.72rem;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header-panel">
+        <div>
+            <h2>📊 볼린저밴드 멀티 타임프레임 추세 분석판</h2>
+            <div class="meta-text">
+                기준 주기: 10분, 30분, 1시간, 4시간, 1일 | 갱신 주기: 매 10분
+            </div>
+        </div>
+        <div style="text-align: right;">
+            <div class="meta-text">마지막 갱신: {{ updated if updated else '대기 중' }}</div>
+            <div class="meta-text">분석 코인: 총 {{ total_analyzed }}개</div>
+        </div>
+    </div>
+
+    {% if status == "initial" %}
+        <div style="text-align: center; padding: 60px 0; background: var(--card-bg); border-radius: 8px;">
+            <p style="font-size: 1.1rem; color: #fbbf24;">⏳ {{ message }}</p>
+        </div>
+    {% else %}
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="text-align: left;">마켓</th>
+                        <th>현재가</th>
+                        <th>종합 점수</th>
+                        <th>10분봉 (10m)</th>
+                        <th>30분봉 (30m)</th>
+                        <th>1시간봉 (1h)</th>
+                        <th>4시간봉 (4h)</th>
+                        <th>일봉 (1d)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for coin in coins %}
+                    <tr>
+                        <td class="market-badge">{{ coin.market }}</td>
+                        <td style="text-align: right; font-weight: 600;">
+                            {% if coin.price >= 100 %}
+                                {{ "{:,.0f}".format(coin.price) }}원
+                            {% elif coin.price >= 1 %}
+                                {{ "{:,.2f}".format(coin.price) }}원
+                            {% else %}
+                                {{ "{:,.4f}".format(coin.price) }}원
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% set s = coin.overall_score %}
+                            <span class="score-pill {% if s >= 4 %}score-high{% elif s <= -2 %}score-low{% else %}score-mid{% endif %}">
+                                {{ "%+d" % s }}점
+                            </span>
+                        </td>
+
+                        {# 타임프레임 반복 렌더링 #}
+                        {% for tf_key in ['10m', '30m', '1h', '4h', '1d'] %}
+                            {% set tf = coin.timeframes.get(tf_key) %}
+                            <td>
+                                {% if tf %}
+                                    <div class="tf-box">
+                                        <span class="pattern-text {% if tf.score > 0 %}pattern-up{% elif tf.score < 0 %}pattern-down{% else %}pattern-mid{% endif %}">
+                                            {{ tf.pattern }}
+                                        </span>
+                                        <span class="tf-detail">
+                                            %B: {{ tf.pct_b }}%
+                                        </span>
+                                        <span class="vol-tag">
+                                            ±{{ tf.expected_volatility_pct }}%
+                                        </span>
+                                    </div>
+                                {% else %}
+                                    <span style="color: var(--text-sub);">-</span>
+                                {% endif %}
+                            </td>
+                        {% endfor %}
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    {% endif %}
+
+</body>
+</html>

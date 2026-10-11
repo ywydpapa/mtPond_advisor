@@ -413,7 +413,7 @@ def start_bb_collector_once():
 # VWMA 크로스 관련 (trend_loop)
 # ===============================================================================================
 async def get_trendcoins():
-    url = 'http://hitoff.iptime.org/api/top30coins'
+    url = 'http://becog.iptime.org:8088/api/top30coins'
     def fetch():
         s = requests.Session()
         s.trust_env = False
@@ -1035,6 +1035,327 @@ async def rest_predict(dateTag, coinName, avgUprate, avgDownrate, currentPrice,
         print("Error!!", e)
         return False
 
+# ===============================================================================================
+# [추가] 볼린저 밴드 멀티 타임프레임 트렌드 조회 API
+# ===============================================================================================
+@app.get("/api/bb-patterns")
+async def get_bb_patterns(limit: int = 50, min_score: int = None):
+    """
+    10분마다 계산된 전체 코인의 멀티 타임프레임(10m, 30m, 1h, 4h, 1d) 분석 결과 조회
+    - limit: 반환할 상위 코인 수 (기본 50)
+    - min_score: 필터링할 최소 종합 상승 점수
+    """
+    if bb_pattern_cache["status"] == "initial":
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "processing",
+                "message": "서버 시작 후 최초 수집 작업이 진행 중입니다. 잠시 후 다시 호출해 주세요."
+            }
+        )
+
+    data = bb_pattern_cache["data"]
+    if min_score is not None:
+        data = [item for item in data if item["overall_score"] >= min_score]
+
+    return {
+        "status": bb_pattern_cache["status"],
+        "updated": bb_pattern_cache["updated"],
+        "total_analyzed": bb_pattern_cache["total_markets"],
+        "result_count": len(data[:limit]),
+        "coins": data[:limit]
+    }
+
+
+@app.get("/bb-patterns", response_class=HTMLResponse)
+async def aiget_bb_patterns(
+    request: Request,
+    limit: int = 150,           # 기본값을 넉넉하게 설정하여 전체 코인 표시
+    min_score: int = None
+):
+    # 1. 초기 수집 중일 때 대기 안내 화면 렌더링
+    if bb_pattern_cache["status"] == "initial":
+        return templates.TemplateResponse(
+            "bb_patterns.html",
+            {
+                "request": request,
+                "status": "initial",
+                "message": "서버 시작 후 최초 수집 작업이 진행 중입니다. 잠시 후 새로고침해 주세요.",
+                "coins": [],
+                "updated": None
+            }
+        )
+
+    data = bb_pattern_cache.get("data", [])
+
+    # 2. 필터링 처리
+    if min_score is not None:
+        data = [item for item in data if item.get("overall_score", 0) >= min_score]
+
+    coins_to_render = data[:limit] if limit is not None else data
+
+    # 3. 템플릿 렌더링
+    return templates.TemplateResponse(
+        "bb_patterns.html",
+        {
+            "request": request,
+            "status": bb_pattern_cache.get("status"),
+            "updated": bb_pattern_cache.get("updated"),
+            "total_analyzed": bb_pattern_cache.get("total_markets", 0),
+            "coins": coins_to_render,
+            "min_score": min_score,
+            "limit": limit
+        }
+    )
+
+@app.post("/api/bb-patterns/force-update")
+async def force_bb_patterns_update():
+    """
+    10분을 기다리지 않고 즉시 전체 코인 지표를 강제 재계산합니다.
+    """
+    asyncio.create_task(run_market_pattern_collector_once())
+    return {
+        "status": "triggered",
+        "message": "백그라운드에서 전체 코인 강제 재계산이 시작되었습니다."
+    }
+
+# ===============================================================================================
+# [추가] 볼린저 밴드 다중 타임프레임 패턴 분석기 설정 & 전역 캐시
+# ===============================================================================================
+# 10분, 30분, 1시간(60), 4시간(240), 일봉(days)
+BB_ANALYSIS_TIMEFRAMES = [
+    {"key": "10m", "type": "minutes", "unit": 10},
+    {"key": "30m", "type": "minutes", "unit": 30},
+    {"key": "1h", "type": "minutes", "unit": 60},
+    {"key": "4h", "type": "minutes", "unit": 240},
+    {"key": "1d", "type": "days", "unit": None},
+]
+
+BB_PATTERN_INTERVAL = 600  # 10분 (600초)
+BB_ANALYSIS_SEMAPHORE_LIMIT = 5  # 업비트 초당 요청 제한(초당 10회) 보호를 위해 동시 요청 5개로 제한
+
+bb_pattern_cache = {
+    "updated": None,
+    "status": "initial",
+    "total_markets": 0,
+    "data": []  # 마켓별 다중 타임프레임 분석 결과 리스트
+}
+_bb_pattern_lock = asyncio.Lock()
+_bb_pattern_collector_started = False
+
+
+# ===============================================================================================
+# [추가] 패턴 분석 전용 비동기 캔들 조회 함수
+# ===============================================================================================
+async def fetch_pattern_candles_async(client: httpx.AsyncClient, market: str, candle_type: str, count: int = 60,
+                                      unit: int = None) -> pd.DataFrame:
+    base_url = "https://api.upbit.com/v1/candles"
+    if candle_type == "days":
+        url = f"{base_url}/days"
+        params = {"market": market, "count": count}
+    else:
+        url = f"{base_url}/minutes/{unit}"
+        params = {"market": market, "count": count}
+
+    try:
+        r = await client.get(url, params=params, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            if not data:
+                return pd.DataFrame()
+            df = pd.DataFrame(data).iloc[::-1].reset_index(drop=True)
+            num_cols = ['opening_price', 'high_price', 'low_price', 'trade_price', 'candle_acc_trade_volume']
+            df[num_cols] = df[num_cols].apply(pd.to_numeric, errors='coerce')
+            return df
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+# ===============================================================================================
+# [추가] 단일 캔들프레임 동적 패턴 및 변동폭 계산 엔진
+# ===============================================================================================
+def analyze_tf_pattern(df: pd.DataFrame, bb_period: int = 20, bb_std: float = 2.0) -> dict:
+    if len(df) < bb_period:
+        return None
+
+    close = df['trade_price']
+    ma = close.rolling(window=bb_period).mean()
+    std = close.rolling(window=bb_period).std(ddof=0)
+
+    upper = ma + (std * bb_std)
+    lower = ma - (std * bb_std)
+
+    # 0 분모 방어
+    band_denom = (upper - lower).replace(0, np.nan)
+    pct_b = (close - lower) / band_denom
+    band_width = (upper - lower) / ma.replace(0, np.nan)
+
+    c_now, c_prev = close.iloc[-1], close.iloc[-2]
+    o_now = df['opening_price'].iloc[-1]
+    pb_now = pct_b.iloc[-1]
+    pb_prev = pct_b.iloc[-2]
+    ma_now, ma_prev = ma.iloc[-1], ma.iloc[-2]
+    bw_now = band_width.iloc[-1]
+
+    # 스퀴즈 및 확장 여부 (최근 20봉 최저폭 기준)
+    min_bw_20 = band_width.tail(20).min()
+    is_squeeze = (bw_now <= (min_bw_20 * 1.15)) if pd.notna(min_bw_20) else False
+    bw_expanding = (bw_now > band_width.iloc[-2]) if pd.notna(bw_now) else False
+
+    # 패턴 판별
+    pattern = "횡보 / 방향 탐색"
+    bias = "중립"
+    score = 0  # 상승 점수(+), 하락 점수(-)
+
+    if pb_now >= 0.85 and pb_prev >= 0.85 and ma_now > ma_prev:
+        pattern = "상승 밴드 라이딩"
+        bias = "상승 지속"
+        score = 2
+    elif is_squeeze and bw_expanding and (pb_now > 0.8 and pb_prev <= 0.8):
+        pattern = "스퀴즈 후 상단 돌파"
+        bias = "강력 상승 기대"
+        score = 3
+    elif pb_prev >= 1.0 and pb_now < 0.9 and (c_now < o_now):
+        pattern = "상단 저항 피뢰침 이탈"
+        bias = "단기 조정/하락 주의"
+        score = -2
+    elif pb_prev <= 0.1 and pb_now > 0.2 and (c_now > o_now):
+        pattern = "하단 지지 양봉 반등"
+        bias = "기술적 반등 기대"
+        score = 2
+    elif pb_prev < 0.5 and pb_now >= 0.5:
+        pattern = "중심선 상향 돌파"
+        bias = "상승 전환"
+        score = 1
+    elif pb_prev > 0.5 and pb_now <= 0.5:
+        pattern = "중심선 하향 이탈"
+        bias = "하락 전환"
+        score = -1
+    elif pb_now <= 0.15 and pb_prev <= 0.15 and ma_now < ma_prev:
+        pattern = "하락 밴드 라이딩"
+        bias = "하락 추세 지속"
+        score = -3
+
+    # 변동폭 계산 (최근 14봉 평균 변동률 %)
+    candle_ranges = df['high_price'] - df['low_price']
+    avg_volatility_pct = (candle_ranges / df['opening_price'] * 100).tail(14).mean()
+
+    return {
+        "pct_b": round(float(pb_now) * 100, 1) if pd.notna(pb_now) else 50.0,
+        "pattern": pattern,
+        "bias": bias,
+        "score": score,
+        "bandwidth_expanding": bool(bw_expanding),
+        "expected_volatility_pct": round(float(avg_volatility_pct), 2) if pd.notna(avg_volatility_pct) else 0.0
+    }
+
+
+# ===============================================================================================
+# [추가] 단일 코인 전체 타임프레임 수집 처리
+# ===============================================================================================
+async def analyze_single_market(client: httpx.AsyncClient, market: str, sem: asyncio.Semaphore) -> dict:
+    tf_data = {}
+    total_score = 0
+    current_price = 0.0
+
+    for tf in BB_ANALYSIS_TIMEFRAMES:
+        async with sem:
+            df = await fetch_pattern_candles_async(
+                client, market, candle_type=tf["type"], count=60, unit=tf["unit"]
+            )
+            # 업비트 호출 레이트 리밋 분산 대기
+            await asyncio.sleep(0.08)
+
+        if not df.empty:
+            if current_price == 0.0:
+                current_price = float(df['trade_price'].iloc[-1])
+            res = analyze_tf_pattern(df)
+            if res:
+                tf_data[tf["key"]] = res
+                # 일봉/4시간봉은 큰 추세이므로 가중치 적용
+                weight = 2 if tf["key"] in ("1d", "4h") else 1
+                total_score += res["score"] * weight
+
+    if not tf_data:
+        return None
+
+    return {
+        "market": market,
+        "price": current_price,
+        "overall_score": total_score,  # 점수가 높을수록 다중 봉에서 상승 신호 일치
+        "timeframes": tf_data
+    }
+
+
+# ===============================================================================================
+# [추가] 10분 백그라운드 수집 워커
+# ===============================================================================================
+async def run_market_pattern_collector_once():
+    global bb_pattern_cache
+    if not krw_markets:
+        return
+
+    sem = asyncio.Semaphore(BB_ANALYSIS_SEMAPHORE_LIMIT)
+    all_results = []
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        # 전체 KRW 마켓을 순회하며 지표 계산
+        for market in krw_markets:
+            try:
+                res = await analyze_single_market(client, market, sem)
+                if res:
+                    all_results.append(res)
+            except Exception as e:
+                print(f"[bb_pattern] market {market} 분석 실패: {e}")
+
+    # 종합 점수가 높은 순으로 정렬 (상승 모멘텀 높은 코인 상위 정렬)
+    all_results.sort(key=lambda x: x["overall_score"], reverse=True)
+
+    async with _bb_pattern_lock:
+        bb_pattern_cache = {
+            "updated": _dt.utcnow().isoformat(),
+            "status": "ok",
+            "total_markets": len(all_results),
+            "data": all_results
+        }
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] KRW {len(all_results)}개 코인 10분 다중타임프레임 분석 완료.")
+
+
+async def bb_pattern_collector_loop():
+    # 서버 기동 후 웹소켓 및 초기 마켓 리스트 세팅을 위해 5초 대기
+    await asyncio.sleep(5)
+    while True:
+        try:
+            await run_market_pattern_collector_once()
+        except Exception as e:
+            print(f"[bb_pattern_collector_loop] Error: {e}")
+
+        # 10분 대기 (BB_PATTERN_INTERVAL = 600)
+        await asyncio.sleep(BB_PATTERN_INTERVAL)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global krw_markets, _collect_tasks_started, _bb_pattern_collector_started
+    if not _collect_tasks_started:
+        krw_markets = await get_krw_markets()
+        for chunk in chunk_markets(krw_markets, 50):
+            asyncio.create_task(upbit_collector(chunk))
+        asyncio.create_task(reset_trade_counts())
+        asyncio.create_task(trend_loop())
+        start_bb_collector_once()
+
+        # [추가] 10분 주기 전체 코인 패턴 분석기 백그라운드 태스크 등록
+        if not _bb_pattern_collector_started:
+            asyncio.create_task(bb_pattern_collector_loop())
+            _bb_pattern_collector_started = True
+
+        _collect_tasks_started = True
+    yield
+
+
+app.router.lifespan_context = lifespan
 # ===============================================================================================
 # END
 # ===============================================================================================
