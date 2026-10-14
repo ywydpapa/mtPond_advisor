@@ -1084,8 +1084,13 @@ async def force_bb_patterns_update():
     }
 
 @app.get("/api/bb-patterns")
-async def get_bb_patterns(limit: int = 150, min_score: int = None, only_recommended: bool = False):
-    if bb_pattern_cache["status"] == "initial":
+async def get_bb_patterns(
+    limit: Optional[int] = 150,
+    min_score: Optional[int] = None,
+    only_recommended: Optional[str] = "false",
+    activity_filter: Optional[str] = None  # 예: 'hot', 'normal', 'cold' 필터 지원 (선택사항)
+):
+    if bb_pattern_cache.get("status") == "initial":
         return JSONResponse(
             status_code=202,
             content={
@@ -1094,23 +1099,37 @@ async def get_bb_patterns(limit: int = 150, min_score: int = None, only_recommen
             }
         )
 
-    data = bb_pattern_cache["data"]
-    if only_recommended:
-        data = [item for item in data if item.get("recommendation") is not None]
+    is_only_rec = str(only_recommended).strip().lower() in ("true", "1", "t", "y", "yes")
+
+    data = list(bb_pattern_cache.get("data", []))
+
+    if is_only_rec:
+        data = [
+            item for item in data
+            if item.get("recommendation") is not None and isinstance(item.get("recommendation"), dict)
+        ]
 
     if min_score is not None:
-        data = [item for item in data if item["overall_score"] >= min_score]
+        data = [item for item in data if item.get("overall_score", 0) >= min_score]
+
+    if activity_filter:
+        act_key = activity_filter.strip().lower()
+        data = [
+            item for item in data
+            if item.get("trade_activity", {}).get("activity_level") == act_key
+        ]
 
     result_data = data[:limit] if limit is not None else data
 
     return {
-        "status": bb_pattern_cache["status"],
-        "updated": bb_pattern_cache["updated"],
-        "total_analyzed": bb_pattern_cache["total_markets"],
+        "status": bb_pattern_cache.get("status"),
+        "updated": bb_pattern_cache.get("updated"),
+        "total_analyzed": bb_pattern_cache.get("total_markets", 0),
         "recommended_count": bb_pattern_cache.get("recommended_count", 0),
         "result_count": len(result_data),
         "coins": result_data
     }
+
 
 @app.get("/bb-patterns", response_class=HTMLResponse)
 async def aiget_bb_patterns(
