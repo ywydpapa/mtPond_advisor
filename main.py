@@ -1085,7 +1085,7 @@ async def force_bb_patterns_update():
 
 @app.get("/api/bb-patterns")
 async def get_bb_patterns(
-    limit: Optional[int] = 150,
+    limit: Optional[int] = 300,
     min_score: Optional[int] = None,
     only_recommended: Optional[str] = "false",
     activity_filter: Optional[str] = None  # 예: 'hot', 'normal', 'cold' 필터 지원 (선택사항)
