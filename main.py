@@ -1,7 +1,6 @@
 import os
 import asyncio
 import json
-import datetime
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 import warnings
@@ -13,28 +12,27 @@ import numpy as np
 import pandas as pd
 import time
 import random
+from typing import List, Optional
+import math
+from datetime import datetime, timedelta, timezone
+
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Depends
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-import numpy as np
-import pandas as pd
-from typing import List, Optional
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-import math
-from datetime import datetime as _dt
 import dotenv
 
 dotenv.load_dotenv()
 
 # -------------------- DB 세팅 --------------------
 DATABASE_URL = os.getenv("dburl")
-engine = create_async_engine(DATABASE_URL, echo=True)
-async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+engine = create_async_engine(DATABASE_URL, echo=True) if DATABASE_URL else None
+async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False) if engine else None
 
 # -------------------- FastAPI 앱 --------------------
 app = FastAPI()
@@ -91,6 +89,9 @@ _EMPTY_FALLBACK_THRESHOLD = 3
 # DB 종속 함수
 # ===============================================================================================
 async def get_db():
+    if not async_session:
+        yield None
+        return
     async with async_session() as session:
         yield session
 
@@ -145,24 +146,20 @@ async def upbit_collector(markets_chunk: List[str]):
 
 async def reset_trade_counts():
     while True:
-        now = datetime.datetime.now()
+        now = datetime.now()
         if now.minute < 30:
             next_reset = now.replace(minute=30, second=0, microsecond=0)
         else:
-            next_reset = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            next_reset = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         sleep_seconds = (next_reset - now).total_seconds()
         await asyncio.sleep(sleep_seconds)
         for market in list(trade_counts.keys()):
             trade_counts[market] = 0
 
-
-import numpy as np
-import pandas as pd
-
+# ===============================================================================================
+# 보조 지표 계산 함수
+# ===============================================================================================
 def calculate_advanced_signals(df: pd.DataFrame, bb_period: int = 20, bb_std: float = 2.0, rsi_period: int = 14, atr_period: int = 14) -> dict:
-    """
-    볼린저 밴드 + 거래량 폭증 + RSI 다이버전스 + ATR 손익비를 결합한 정밀 신호 계산
-    """
     if len(df) < max(bb_period, rsi_period, atr_period) + 10:
         return None
 
@@ -171,7 +168,7 @@ def calculate_advanced_signals(df: pd.DataFrame, bb_period: int = 20, bb_std: fl
     low = df['low_price']
     vol = df['candle_acc_trade_volume']
 
-    # 1. 볼린저 밴드 계산
+    # 1. 볼린저 밴드
     ma = close.rolling(bb_period).mean()
     std = close.rolling(bb_period).std(ddof=0)
     upper = ma + (std * bb_std)
@@ -179,14 +176,14 @@ def calculate_advanced_signals(df: pd.DataFrame, bb_period: int = 20, bb_std: fl
     pct_b = (close - lower) / (upper - lower).replace(0, np.nan)
     band_width = (upper - lower) / ma.replace(0, np.nan)
 
-    # 2. 거래량 폭증 여부 (직전 20봉 평균 거래량 대비 200% 이상)
+    # 2. 거래량 폭증 (직전 20봉 평균 대비 200% 이상)
     vol_ma20 = vol.rolling(20).mean()
     curr_vol = vol.iloc[-1]
     prev_vol_avg = vol_ma20.iloc[-2]
     volume_ratio = (curr_vol / prev_vol_avg) if prev_vol_avg > 0 else 1.0
     is_volume_spike = volume_ratio >= 2.0
 
-    # 3. RSI 계산
+    # 3. RSI
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -195,18 +192,14 @@ def calculate_advanced_signals(df: pd.DataFrame, bb_period: int = 20, bb_std: fl
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
 
-    # 4. RSI 약세 다이버전스 감지 (최근 15봉 내 고가 갱신 vs RSI 하락)
-    # 조건: 현재 가격이 최근 15봉 최고가 부근이지만, RSI 고점은 이전보다 낮아진 경우
-    recent_high_idx = high.tail(15).idxmax()
-    curr_idx = df.index[-1]
+    # 4. RSI 약세 다이버전스
     is_bearish_div = False
-
-    if high.iloc[-1] >= high.tail(15).max() * 0.99:  # 신고가 트라이 중
+    if high.iloc[-1] >= high.tail(15).max() * 0.99:
         prev_rsi_peak = rsi.tail(15).iloc[:-2].max()
-        if rsi.iloc[-1] < prev_rsi_peak - 3.0:      # RSI 고점은 명확히 하락
+        if pd.notna(prev_rsi_peak) and (rsi.iloc[-1] < prev_rsi_peak - 3.0):
             is_bearish_div = True
 
-    # 5. ATR 계산 및 손익비(Risk/Reward Ratio) 산정
+    # 5. ATR 및 손익비(Risk/Reward Ratio)
     prev_close = close.shift(1)
     tr = pd.concat([
         (high - low),
@@ -217,32 +210,27 @@ def calculate_advanced_signals(df: pd.DataFrame, bb_period: int = 20, bb_std: fl
 
     curr_close = close.iloc[-1]
     curr_upper = upper.iloc[-1]
-    curr_atr = atr.iloc[-1]
+    curr_atr = atr.iloc[-1] if pd.notna(atr.iloc[-1]) else 0.0
 
-    # 익절 목표가(TP): 상단 밴드 / 손절가(SL): 현재가 - (1.5 * ATR)
     expected_profit = max(0.0, curr_upper - curr_close)
-    expected_risk = max(curr_close * 0.005, curr_atr * 1.5)  # 최소 0.5% 기본 슬리피지 방어
+    expected_risk = max(curr_close * 0.005, curr_atr * 1.5)
     rr_ratio = expected_profit / expected_risk if expected_risk > 0 else 0.0
 
-    # 6. 진입 시그널 필터링 판정
-    c_now, c_prev = close.iloc[-1], close.iloc[-2]
+    # 6. 진입 시그널 판정
     pb_now, pb_prev = pct_b.iloc[-1], pct_b.iloc[-2]
     min_bw_20 = band_width.tail(20).min()
-    is_squeeze = band_width.iloc[-1] <= (min_bw_20 * 1.15)
-    bw_expanding = band_width.iloc[-1] > band_width.iloc[-2]
+    is_squeeze = band_width.iloc[-1] <= (min_bw_20 * 1.15) if pd.notna(min_bw_20) else False
+    bw_expanding = band_width.iloc[-1] > band_width.iloc[-2] if pd.notna(band_width.iloc[-1]) else False
 
     signal_status = "HOLD"
     reasons = []
 
-    # [매수 조건 1] 스퀴즈 탈출 상단 돌파 (거래량 폭증 필수)
     if is_squeeze and bw_expanding and (pb_now >= 0.8):
         if is_volume_spike and not is_bearish_div:
             signal_status = "STRONG_BUY"
             reasons.append("스퀴즈 탈출 + 거래량 폭증")
         elif not is_volume_spike:
             reasons.append("가짜 돌파 의심 (거래량 부족)")
-
-    # [매수 조건 2] 하단 지지 후 중심선 상향 돌파 (손익비 충족 필수)
     elif pb_prev < 0.5 and pb_now >= 0.5:
         if not is_bearish_div:
             if rr_ratio >= 1.5:
@@ -251,15 +239,14 @@ def calculate_advanced_signals(df: pd.DataFrame, bb_period: int = 20, bb_std: fl
             else:
                 reasons.append(f"손익비 미달 ({rr_ratio:.2f} < 1.5)")
 
-    # [탈락 조건] 상단 근처이나 RSI 약세 다이버전스 출현
     if is_bearish_div and pb_now >= 0.8:
         signal_status = "WARNING_SELL"
         reasons.append("RSI 약세 다이버전스 (고점 이탈 주의)")
 
     return {
         "price": curr_close,
-        "pct_b": round(float(pb_now) * 100, 1),
-        "volume_ratio": round(float(volume_ratio) * 100, 1),  # %
+        "pct_b": round(float(pb_now) * 100, 1) if pd.notna(pb_now) else 50.0,
+        "volume_ratio": round(float(volume_ratio) * 100, 1),
         "is_vol_spike": is_volume_spike,
         "is_bearish_div": is_bearish_div,
         "atr": round(float(curr_atr), 2),
@@ -268,10 +255,6 @@ def calculate_advanced_signals(df: pd.DataFrame, bb_period: int = 20, bb_std: fl
         "reason": ", ".join(reasons) if reasons else "특이 패턴 없음"
     }
 
-
-# ===============================================================================================
-# Top30 외부(내부 API) 기반 수집 함수
-# ===============================================================================================
 async def fetch_top30_from_api(max_retry: int = 3, retry_delay: float = 1.0) -> list:
     for attempt in range(max_retry):
         try:
@@ -279,16 +262,12 @@ async def fetch_top30_from_api(max_retry: int = 3, retry_delay: float = 1.0) -> 
                 r = await client.get(TOP30_ENDPOINT)
                 if r.status_code == 200:
                     data = r.json()
-                    markets = data.get("markets", [])
-                    return markets
+                    return data.get("markets", [])
         except Exception as e:
             print(f"[fetch_top30_from_api] attempt={attempt+1} error={e}")
         await asyncio.sleep(retry_delay)
     return []
 
-# ===============================================================================================
-# 지표 계산 관련
-# ===============================================================================================
 async def fetch_candles_async(client: httpx.AsyncClient, market: str, unit: int, count: int) -> pd.DataFrame:
     url = f"https://api.upbit.com/v1/candles/minutes/{unit}"
     params = {"market": market, "count": count}
@@ -314,9 +293,6 @@ async def fetch_candles_async(client: httpx.AsyncClient, market: str, unit: int,
     return df
 
 def evaluate_coin_recommendation(market: str, tf_results: dict) -> dict:
-    """
-    1d, 4h, 1h, 30m, 10m 결과를 종합하여 최종 추천 여부 결정
-    """
     daily = tf_results.get("1d")
     h4 = tf_results.get("4h")
     m30 = tf_results.get("30m")
@@ -325,24 +301,19 @@ def evaluate_coin_recommendation(market: str, tf_results: dict) -> dict:
     if not (daily and h4 and m30 and m10):
         return None
 
-    # 규칙 1: 상위 타임프레임 필터 (일봉 또는 4시간봉이 최소 20MA 중심선 이상, 역배열 코인 차단)
     if daily["pct_b"] < 40.0 and h4["pct_b"] < 40.0:
-        return None  # 하락 추세 코인 전면 배제
+        return None
 
-    # 규칙 2: RSI 다이버전스 필터 (단기 봉에서 약세 다이버전스가 떴다면 즉시 제외)
     if m10["is_bearish_div"] or m30["is_bearish_div"]:
         return None
 
-    # 규칙 3: 단기 봉(30m 또는 10m)에서 명확한 진입 시그널 발생 여부
     trigger_tf = m30 if m30["signal"] in ("BUY", "STRONG_BUY") else (m10 if m10["signal"] in ("BUY", "STRONG_BUY") else None)
     if not trigger_tf:
         return None
 
-    # 규칙 4: 손익비(Risk/Reward) 최종 확인
     if trigger_tf["rr_ratio"] < 1.5:
         return None
 
-    # 최종 점수 산출 (거래량 배수 + 손익비 가중치)
     score = (trigger_tf["volume_ratio"] / 100.0) * 2.0 + trigger_tf["rr_ratio"]
 
     return {
@@ -356,13 +327,11 @@ def evaluate_coin_recommendation(market: str, tf_results: dict) -> dict:
         "priority_score": round(score, 2)
     }
 
-# --- (기존 전체 코드 중 compute_indicators 함수만 교체하는 패치) ---
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if out.empty:
         return out
 
-    # Bollinger
     if len(out) >= BB_PERIOD:
         out["MA"] = out["close"].rolling(BB_PERIOD).mean()
         out["STD"] = out["close"].rolling(BB_PERIOD).std(ddof=0)
@@ -381,13 +350,13 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         out["Lower"] = np.nan
         out["BB_Pos"] = 0.0
         out["BandWidth"] = 0.0
-    # HH/LL
+
     out["HH20"] = out["high"].rolling(HHLL_PERIOD).max()
     out["LL20"] = out["low"].rolling(HHLL_PERIOD).min()
     span = out["HH20"] - out["LL20"]
     out["Range_Pos20"] = (out["close"] - out["LL20"]) / span * 100
     out.loc[(span == 0) | span.isna(), "Range_Pos20"] = 0.0
-    # RSI
+
     delta = out["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -397,7 +366,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["RSI"] = 100 - (100 / (1 + rs))
     out.loc[avg_loss == 0, "RSI"] = 100
     out.loc[(avg_gain == 0) & (avg_loss > 0), "RSI"] = 0
-    # ATR
+
     prev_close = out["close"].shift(1)
     tr_components = pd.concat([
         (out["high"] - out["low"]),
@@ -406,35 +375,29 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1)
     tr = tr_components.max(axis=1)
     out["ATR"] = tr.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()
-    # MACD
+
     ema_fast = out["close"].ewm(span=MACD_FAST, adjust=False).mean()
     ema_slow = out["close"].ewm(span=MACD_SLOW, adjust=False).mean()
     out["MACD"] = ema_fast - ema_slow
     out["MACD_Signal"] = out["MACD"].ewm(span=MACD_SIGNAL, adjust=False).mean()
     out["MACD_Hist"] = out["MACD"] - out["MACD_Signal"]
-    # Trend10 (문자열 패턴)
+
     out = _add_trend10_for_collector(out, window=10)
-    # NaN/inf 정리
     out.replace([np.inf, -np.inf], np.nan, inplace=True)
-    # 숫자 컬럼과 문자열 컬럼 분리
+
     core_numeric_cols = [
         "close", "BB_Pos", "BandWidth", "Range_Pos20",
         "RSI", "ATR", "MACD", "MACD_Signal", "MACD_Hist"
     ]
-    core_non_numeric_cols = ["Trend10"]  # 필요 시 추가
-    # 존재하는 숫자 컬럼만 선택
+    core_non_numeric_cols = ["Trend10"]
     exist_num = [c for c in core_numeric_cols if c in out.columns]
     if exist_num:
-        # 명시적 float 변환 후 결측치 0.0
-          # (astype 전에 object 섞인 경우를 대비해 to_numeric 사용 옵션도 가능)
         for c in exist_num:
-            # to_numeric로 강제 변환 (errors='coerce'로 안전하게 NaN 처리)
             out[c] = pd.to_numeric(out[c], errors='coerce')
         out[exist_num] = out[exist_num].fillna(0.0)
-    # 비숫자 컬럼은 건드리지 않거나 필요 시 결측치 None 처리
+
     for c in core_non_numeric_cols:
         if c in out.columns:
-            # 패턴이 아직 생성 안된 구간은 그대로 None 유지
             out[c] = out[c].where(out[c].notna(), None)
     return out
 
@@ -464,12 +427,7 @@ def _add_trend10_for_collector(df: pd.DataFrame, window: int = 10, doji_char: st
     out.drop(columns=["_mid"], inplace=True, errors="ignore")
     return out
 
-# 새 헬퍼 추가
 def _sanitize_value(v, use_null=False):
-    """
-    숫자 값에서 NaN/inf 제거.
-    use_null=True 이면 None 반환, False 이면 0.0 반환.
-    """
     if isinstance(v, (float, int)):
         if math.isnan(v) or math.isinf(v):
             return None if use_null else 0.0
@@ -511,7 +469,6 @@ async def collect_bb_for_timeframe(client: httpx.AsyncClient, markets: list, uni
             "volume": _sanitize_value(last.get("volume", None)),
             "time": last.name.isoformat()
         }
-        # 혹시 남은 NaN/inf 정리 (미방어 컬럼 대비)
         record = _sanitize_record(record)
         results.append(record)
         await asyncio.sleep(0.02)
@@ -528,7 +485,7 @@ async def _run_bb_collection_once():
             markets = krw_markets[:30]
         else:
             bbtrend_cache.update({
-                "updated": _dt.utcnow().isoformat(),
+                "updated": datetime.now(timezone.utc).isoformat(),
                 "timeframes": {},
                 "markets_used": [],
                 "status": "empty"
@@ -546,7 +503,7 @@ async def _run_bb_collection_once():
 
     status_flag = "ok" if any(tf_results.values()) else "empty"
     bbtrend_cache.update({
-        "updated": _dt.utcnow().isoformat(),
+        "updated": datetime.now(timezone.utc).isoformat(),
         "timeframes": tf_results,
         "markets_used": markets,
         "status": status_flag
@@ -582,15 +539,10 @@ async def get_trendcoins():
         response.raise_for_status()
         data = response.json()
         coins = data.get('markets', [])
-        if not isinstance(coins, list):
-            print("get_trendcoins: 예상치 못한 응답 형식.")
-            return []
-        return coins
+        return coins if isinstance(coins, list) else []
     except Exception as e:
-        print(f"get_trendcoins: 요청 실패 - {e}")
+        print(f"get_trendcoins: 요청 실패 {e}")
         return []
-
-cross_memory = {}  # 전역 (최초 1회)
 
 RL_RE = re.compile(r"group=(\w+); *min=(\d+); *sec=(\d+)")
 
@@ -610,35 +562,24 @@ def polite_get(url, max_retry=8, base_sleep=0.12, jitter=0.05):
         rem = parse_remaining_req(rem_header)
 
         if resp.status_code == 200:
-            # 남은 초당 호출량이 1 이하이면 잠깐 쉬어 버스트 방지
             if rem and rem["sec"] <= 1:
                 time.sleep(0.25 + random.uniform(0, 0.05))
             return resp
 
         if resp.status_code == 429:
             ra = resp.headers.get("Retry-After")
-            if ra:
-                wait = float(ra)
-            else:
-                wait = min(2.0, base_sleep * (2 ** (attempt - 1)) + random.uniform(0, jitter))
-                if rem and rem["sec"] == 0:
-                    wait = max(wait, 0.6)
+            wait = float(ra) if ra else min(2.0, base_sleep * (2 ** (attempt - 1)) + random.uniform(0, jitter))
+            if rem and rem["sec"] == 0:
+                wait = max(wait, 0.6)
             print(f"[WARN] 429 too_many_requests attempt={attempt} waiting {wait:.3f}s rem={rem}")
             time.sleep(wait)
             continue
 
-        # 기타 오류
         resp.raise_for_status()
 
     raise RuntimeError("429 재시도 초과")
 
-async def peak_trade(
-    ticker='KRW-BTC',
-    short_window=3,
-    long_window=20,
-    count=180,
-    candle_unit='1h'
-):
+async def peak_trade(ticker='KRW-BTC', short_window=3, long_window=20, count=180, candle_unit='1h'):
     candle_map = {
         '1d': ('days', ''),
         '4h': ('minutes', 240),
@@ -654,11 +595,7 @@ async def peak_trade(
         raise ValueError(f"지원하지 않는 단위: {candle_unit}")
     api_type, minute = candle_map[candle_unit]
 
-    if api_type == 'days':
-        url = f'https://api.upbit.com/v1/candles/days?market={ticker}&count={count}'
-    else:
-        url = f'https://api.upbit.com/v1/candles/minutes/{minute}?market={ticker}&count={count}'
-
+    url = f'https://api.upbit.com/v1/candles/days?market={ticker}&count={count}' if api_type == 'days' else f'https://api.upbit.com/v1/candles/minutes/{minute}?market={ticker}&count={count}'
     resp = polite_get(url)
     try:
         data = resp.json()
@@ -667,50 +604,26 @@ async def peak_trade(
 
     if isinstance(data, dict) and 'error' in data:
         raise RuntimeError(f"Upbit API 오류: {data['error']}")
-
-    if not isinstance(data, list):
-        raise RuntimeError(f"예상치 못한 응답 타입: {type(data)} {str(data)[:200]}")
-
-    if len(data) == 0:
+    if not isinstance(data, list) or len(data) == 0:
         cross_memory[ticker] = {'error': '빈 데이터', 'ticker': ticker}
         return
 
     df = pd.DataFrame(data)
-
-    if 'candle_date_time_utc' not in df.columns:
-        raise RuntimeError(f"필수 컬럼 없음 columns={list(df.columns)}")
-
-    idx = (
-        pd.to_datetime(df['candle_date_time_utc'], format='%Y-%m-%dT%H:%M:%S', utc=True)
-        .dt.tz_convert('Asia/Seoul')
-    )
+    idx = pd.to_datetime(df['candle_date_time_utc'], format='%Y-%m-%dT%H:%M:%S', utc=True).dt.tz_convert('Asia/Seoul')
     df.index = idx
     df.index.name = 'candle_time_kst'
     df = df.sort_index()
 
-    # 최소 롤링 길이 확보
     need_len = max(short_window, long_window)
     if len(df) < need_len:
-        cross_memory[ticker] = {
-            'error': '데이터 길이 부족',
-            'len': len(df),
-            'need': need_len
-        }
+        cross_memory[ticker] = {'error': '데이터 길이 부족', 'len': len(df), 'need': need_len}
         return
 
-    sw_col = f'VWMA_{short_window}'
-    lw_col = f'VWMA_{long_window}'
-
-    df[sw_col] = (
-        (df['trade_price'] * df['candle_acc_trade_volume']).rolling(window=short_window).sum()
-        / df['candle_acc_trade_volume'].rolling(window=short_window).sum()
-    )
-    df[lw_col] = (
-        (df['trade_price'] * df['candle_acc_trade_volume']).rolling(window=long_window).sum()
-        / df['candle_acc_trade_volume'].rolling(window=long_window).sum()
-    )
-
+    sw_col, lw_col = f'VWMA_{short_window}', f'VWMA_{long_window}'
+    df[sw_col] = (df['trade_price'] * df['candle_acc_trade_volume']).rolling(window=short_window).sum() / df['candle_acc_trade_volume'].rolling(window=short_window).sum()
+    df[lw_col] = (df['trade_price'] * df['candle_acc_trade_volume']).rolling(window=long_window).sum() / df['candle_acc_trade_volume'].rolling(window=long_window).sum()
     df['vwma_diff'] = df[sw_col] - df[lw_col]
+
     valid = df.dropna(subset=['vwma_diff'])
     if valid.empty:
         cross_memory[ticker] = {'error': 'VWMA NaN 지속', 'ticker': ticker}
@@ -723,15 +636,10 @@ async def peak_trade(
 
     crosses = pd.concat([golden, dead]).sort_index()
     last_2 = crosses.tail(2)
-
     now = pd.Timestamp.now(tz='Asia/Seoul')
+
     if last_2.empty:
-        cross_memory[ticker] = {
-            'last_2_crosses': [],
-            'latest_cross_type': None,
-            'note': '교차 없음',
-            'updated': now
-        }
+        cross_memory[ticker] = {'last_2_crosses': [], 'latest_cross_type': None, 'note': '교차 없음', 'updated': now}
         return
 
     latest_cross_time = last_2.index[-1]
@@ -753,10 +661,7 @@ async def peak_trade(
         sw_angle = lw_angle = vol_angle = None
 
     cross_memory[ticker] = {
-        'last_2_crosses': [
-            {'type': r['cross_type'], 'time': t}
-            for t, r in last_2.iterrows()
-        ],
+        'last_2_crosses': [{'type': r['cross_type'], 'time': t} for t, r in last_2.iterrows()],
         'latest_cross_type': last_2.iloc[-1]['cross_type'],
         'latest_cross_time': latest_cross_time,
         'now': now,
@@ -770,7 +675,6 @@ async def peak_trade(
         'volume': df['candle_acc_trade_volume'].iloc[-1],
         'volume_angle': vol_angle
     }
-
 
 async def trend_loop():
     while True:
@@ -786,9 +690,6 @@ async def trend_loop():
             await asyncio.sleep(0.5)
         await asyncio.sleep(15)
 
-# ===============================================================================================
-# 가격 조회
-# ===============================================================================================
 async def get_current_prices():
     server_url = "https://api.upbit.com"
     params = {"quote_currencies": "KRW"}
@@ -802,41 +703,361 @@ async def get_current_prices():
             result.append({"market": market, "trade_price": trade_price})
     return result
 
-async def get_current_price(coinn):
-    server_url = "https://api.upbit.com"
-    params = {"quote_currencies": "KRW"}
-    res = requests.get(server_url + "/v1/ticker/all", params=params)
-    data = res.json()
-    result = []
-    for item in data:
-        market = item.get("market")
-        trade_price = item.get("trade_price")
-        if market and trade_price and market == coinn:
-            result.append({"market": market, "trade_price": trade_price})
-    return result
+# ===============================================================================================
+# 패턴 분석 전역 캐시 & 체결 건수 함수
+# ===============================================================================================
+BB_ANALYSIS_TIMEFRAMES = [
+    {"key": "10m", "type": "minutes", "unit": 10},
+    {"key": "30m", "type": "minutes", "unit": 30},
+    {"key": "1h", "type": "minutes", "unit": 60},
+    {"key": "4h", "type": "minutes", "unit": 240},
+    {"key": "1d", "type": "days", "unit": None},
+]
+
+BB_PATTERN_INTERVAL = 600
+BB_ANALYSIS_SEMAPHORE_LIMIT = 5
+
+bb_pattern_cache = {
+    "updated": None,
+    "status": "initial",
+    "total_markets": 0,
+    "data": []
+}
+_bb_pattern_lock = asyncio.Lock()
+_bb_pattern_collector_started = False
+
+async def fetch_pattern_candles_async(client: httpx.AsyncClient, market: str, candle_type: str, count: int = 60, unit: int = None) -> pd.DataFrame:
+    base_url = "https://api.upbit.com/v1/candles"
+    url = f"{base_url}/days" if candle_type == "days" else f"{base_url}/minutes/{unit}"
+    params = {"market": market, "count": count}
+
+    try:
+        r = await client.get(url, params=params, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            if not data:
+                return pd.DataFrame()
+            df = pd.DataFrame(data).iloc[::-1].reset_index(drop=True)
+            num_cols = ['opening_price', 'high_price', 'low_price', 'trade_price', 'candle_acc_trade_volume']
+            df[num_cols] = df[num_cols].apply(pd.to_numeric, errors='coerce')
+            return df
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+async def get_trade_activity(market: str, client: httpx.AsyncClient):
+    """
+    최근 500개 체결 틱을 기준으로:
+    1) 직전 10분 체결 건수
+    2) 직전 1시간 체결 건수
+    3) 마지막 체결 경과 시간(초)
+    """
+    url = f"https://api.upbit.com/v1/trades/ticks?market={market}&count=500"
+    try:
+        res = await client.get(url, timeout=5.0)
+        if res.status_code != 200:
+            return {"trade_count_10m": 0, "trade_count_1h": 0, "last_trade_sec": 9999, "activity_level": "cold"}
+
+        ticks = res.json()
+        if not ticks:
+            return {"trade_count_10m": 0, "trade_count_1h": 0, "last_trade_sec": 9999, "activity_level": "cold"}
+
+        now_utc = datetime.now(timezone.utc)
+        ten_min_ago = now_utc - timedelta(minutes=10)
+        one_hour_ago = now_utc - timedelta(hours=1)
+
+        c_10m = 0
+        c_1h = 0
+
+        for t in ticks:
+            dt_str = f"{t['trade_date_utc']} {t['trade_time_utc']}"
+            t_dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            if t_dt >= ten_min_ago:
+                c_10m += 1
+            if t_dt >= one_hour_ago:
+                c_1h += 1
+
+        latest_str = f"{ticks[0]['trade_date_utc']} {ticks[0]['trade_time_utc']}"
+        latest_dt = datetime.strptime(latest_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        last_trade_sec = int((now_utc - latest_dt).total_seconds())
+
+        if c_10m >= 60:
+            activity_level = "hot"
+        elif c_10m >= 10:
+            activity_level = "normal"
+        else:
+            activity_level = "cold"
+
+        return {
+            "trade_count_10m": c_10m,
+            "trade_count_1h": c_1h,
+            "last_trade_sec": last_trade_sec,
+            "activity_level": activity_level
+        }
+    except Exception:
+        return {"trade_count_10m": 0, "trade_count_1h": 0, "last_trade_sec": 9999, "activity_level": "cold"}
+
+def analyze_tf_pattern(df: pd.DataFrame, bb_period: int = 20, bb_std: float = 2.0, rsi_period: int = 14, atr_period: int = 14) -> dict:
+    if len(df) < max(bb_period, rsi_period, atr_period) + 10:
+        return None
+
+    close = df['trade_price']
+    high = df['high_price']
+    low = df['low_price']
+    vol = df['candle_acc_trade_volume']
+
+    ma = close.rolling(window=bb_period).mean()
+    std = close.rolling(window=bb_period).std(ddof=0)
+    upper = ma + (std * bb_std)
+    lower = ma - (std * bb_std)
+
+    band_denom = (upper - lower).replace(0, np.nan)
+    pct_b = (close - lower) / band_denom
+    band_width = (upper - lower) / ma.replace(0, np.nan)
+
+    c_now, c_prev = close.iloc[-1], close.iloc[-2]
+    o_now = df['opening_price'].iloc[-1]
+    pb_now = pct_b.iloc[-1]
+    pb_prev = pct_b.iloc[-2]
+    ma_now, ma_prev = ma.iloc[-1], ma.iloc[-2]
+    bw_now = band_width.iloc[-1]
+
+    min_bw_20 = band_width.tail(20).min()
+    is_squeeze = (bw_now <= (min_bw_20 * 1.15)) if pd.notna(min_bw_20) else False
+    bw_expanding = (bw_now > band_width.iloc[-2]) if pd.notna(bw_now) else False
+
+    vol_ma20 = vol.rolling(20).mean()
+    curr_vol = vol.iloc[-1]
+    prev_vol_avg = vol_ma20.iloc[-2]
+    volume_ratio = (curr_vol / prev_vol_avg) if prev_vol_avg > 0 else 1.0
+    is_volume_spike = bool(volume_ratio >= 2.0)
+
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / rsi_period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / rsi_period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+
+    is_bearish_div = False
+    if high.iloc[-1] >= high.tail(15).max() * 0.99:
+        prev_rsi_peak = rsi.tail(15).iloc[:-2].max()
+        if pd.notna(prev_rsi_peak) and (rsi.iloc[-1] < prev_rsi_peak - 3.0):
+            is_bearish_div = True
+
+    prev_close_s = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close_s).abs(),
+        (low - prev_close_s).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / atr_period, adjust=False).mean()
+
+    curr_close = close.iloc[-1]
+    curr_upper = upper.iloc[-1]
+    curr_atr = atr.iloc[-1] if pd.notna(atr.iloc[-1]) else 0.0
+
+    expected_profit = max(0.0, curr_upper - curr_close)
+    expected_risk = max(curr_close * 0.005, curr_atr * 1.5)
+    rr_ratio = expected_profit / expected_risk if expected_risk > 0 else 0.0
+
+    pattern = "횡보 / 방향 탐색"
+    bias = "중립"
+    score = 0
+    signal_status = "HOLD"
+    reasons = []
+
+    if pb_now >= 0.85 and pb_prev >= 0.85 and ma_now > ma_prev:
+        pattern = "상승 밴드 라이딩"
+        bias = "상승 지속"
+        score = 2
+    elif is_squeeze and bw_expanding and (pb_now > 0.8 and pb_prev <= 0.8):
+        pattern = "스퀴즈 후 상단 돌파"
+        bias = "강력 상승 기대"
+        score = 3
+    elif pb_prev >= 1.0 and pb_now < 0.9 and (c_now < o_now):
+        pattern = "상단 저항 피뢰침 이탈"
+        bias = "단기 조정/하락 주의"
+        score = -2
+    elif pb_prev <= 0.1 and pb_now > 0.2 and (c_now > o_now):
+        pattern = "하단 지지 양봉 반등"
+        bias = "기술적 반등 기대"
+        score = 2
+    elif pb_prev < 0.5 and pb_now >= 0.5:
+        pattern = "중심선 상향 돌파"
+        bias = "상승 전환"
+        score = 1
+    elif pb_prev > 0.5 and pb_now <= 0.5:
+        pattern = "중심선 하향 이탈"
+        bias = "하락 전환"
+        score = -1
+    elif pb_now <= 0.15 and pb_prev <= 0.15 and ma_now < ma_prev:
+        pattern = "하락 밴드 라이딩"
+        bias = "하락 추세 지속"
+        score = -3
+
+    if is_squeeze and bw_expanding and (pb_now >= 0.8):
+        if is_volume_spike and not is_bearish_div:
+            signal_status = "STRONG_BUY"
+            reasons.append("스퀴즈 탈출 + 거래량 폭증")
+        elif not is_volume_spike:
+            reasons.append("가짜 돌파 의심 (거래량 부족)")
+    elif pb_prev < 0.5 and pb_now >= 0.5:
+        if not is_bearish_div:
+            if rr_ratio >= 1.5:
+                signal_status = "BUY"
+                reasons.append(f"중심선 돌파 (손익비 {rr_ratio:.2f})")
+            else:
+                reasons.append(f"손익비 미달 ({rr_ratio:.2f} < 1.5)")
+
+    if is_bearish_div and pb_now >= 0.8:
+        signal_status = "WARNING_SELL"
+        reasons.append("RSI 약세 다이버전스 (고점 이탈 주의)")
+
+    candle_ranges = high - low
+    avg_volatility_pct = (candle_ranges / df['opening_price'] * 100).tail(14).mean()
+
+    return {
+        "price": curr_close,
+        "pct_b": round(float(pb_now) * 100, 1) if pd.notna(pb_now) else 50.0,
+        "pattern": pattern,
+        "bias": bias,
+        "score": score,
+        "bandwidth_expanding": bool(bw_expanding),
+        "expected_volatility_pct": round(float(avg_volatility_pct), 2) if pd.notna(avg_volatility_pct) else 0.0,
+        "volume_ratio": round(float(volume_ratio) * 100, 1),
+        "is_vol_spike": is_volume_spike,
+        "is_bearish_div": is_bearish_div,
+        "atr": round(float(curr_atr), 2),
+        "rr_ratio": round(float(rr_ratio), 2),
+        "signal": signal_status,
+        "reason": ", ".join(reasons) if reasons else "특이 패턴 없음"
+    }
+
+async def analyze_single_market(client: httpx.AsyncClient, market: str, sem: asyncio.Semaphore) -> dict:
+    tf_data = {}
+    total_score = 0
+    current_price = 0.0
+
+    for tf in BB_ANALYSIS_TIMEFRAMES:
+        async with sem:
+            df = await fetch_pattern_candles_async(
+                client, market, candle_type=tf["type"], count=60, unit=tf["unit"]
+            )
+            await asyncio.sleep(0.08)
+
+        if not df.empty:
+            if current_price == 0.0:
+                current_price = float(df['trade_price'].iloc[-1])
+            res = analyze_tf_pattern(df)
+            if res:
+                tf_data[tf["key"]] = res
+                weight = 2 if tf["key"] in ("1d", "4h") else 1
+                total_score += res["score"] * weight
+
+    if not tf_data:
+        return None
+
+    recommendation = evaluate_coin_recommendation(market, tf_data)
+    # [체결 활동도 데이터 결합]
+    trade_activity = await get_trade_activity(market, client)
+
+    return {
+        "market": market,
+        "price": current_price,
+        "overall_score": total_score,
+        "trade_activity": trade_activity,
+        "recommendation": recommendation,
+        "timeframes": tf_data
+    }
+
+async def run_market_pattern_collector_once():
+    global bb_pattern_cache
+    if not krw_markets:
+        return
+
+    sem = asyncio.Semaphore(BB_ANALYSIS_SEMAPHORE_LIMIT)
+    all_results = []
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        for market in krw_markets:
+            try:
+                res = await analyze_single_market(client, market, sem)
+                if res:
+                    all_results.append(res)
+            except Exception as e:
+                print(f"[bb_pattern] market {market} 분석 실패: {e}")
+
+    all_results.sort(
+        key=lambda x: (
+            x["overall_score"],
+            1 if x.get("recommendation") else 0,
+            x["recommendation"]["priority_score"] if x.get("recommendation") else 0
+        ),
+        reverse=True
+    )
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    async with _bb_pattern_lock:
+        bb_pattern_cache = {
+            "updated": now_str,
+            "status": "ok",
+            "total_markets": len(all_results),
+            "recommended_count": len([x for x in all_results if x.get("recommendation")]),
+            "data": all_results
+        }
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] KRW {len(all_results)}개 코인 분석 완료 (추천 통과: {bb_pattern_cache['recommended_count']}개)")
+
+async def bb_pattern_collector_loop():
+    await asyncio.sleep(5)
+    try:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 초기 전체 코인 패턴 수집 시작")
+        await run_market_pattern_collector_once()
+    except Exception as e:
+        print(f"[bb_pattern_collector_loop Initial Error]: {e}")
+
+    while True:
+        now = datetime.now()
+        # 10분 정각 스케줄링 계산
+        minute_offset = 10 - (now.minute % 10)
+        target_time = (now + timedelta(minutes=minute_offset)).replace(second=2, microsecond=0)
+        sleep_seconds = (target_time - now).total_seconds()
+
+        print(f"[{now.strftime('%H:%M:%S')}] 다음 수집 예정 시각: {target_time.strftime('%H:%M:%S')} (약 {int(sleep_seconds)}초 대기)")
+        await asyncio.sleep(sleep_seconds)
+
+        try:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 10분 정각 정기 수집 시작")
+            await run_market_pattern_collector_once()
+        except Exception as e:
+            print(f"[bb_pattern_collector_loop Error]: {e}")
 
 # ===============================================================================================
-# lifespan
+# 통합 Lifespan 관리
 # ===============================================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global krw_markets, _collect_tasks_started
+    global krw_markets, _collect_tasks_started, _bb_pattern_collector_started
     if not _collect_tasks_started:
         krw_markets = await get_krw_markets()
-        # 실시간 체결 수집
         for chunk in chunk_markets(krw_markets, 50):
             asyncio.create_task(upbit_collector(chunk))
         asyncio.create_task(reset_trade_counts())
         asyncio.create_task(trend_loop())
-        start_bb_collector_once()  # 다중 타임프레임 collector 시작
+        start_bb_collector_once()
+
+        if not _bb_pattern_collector_started:
+            asyncio.create_task(bb_pattern_collector_loop())
+            _bb_pattern_collector_started = True
+
         _collect_tasks_started = True
     yield
-    # 종료 시 정리 로직 필요하면 추가
 
 app.router.lifespan_context = lifespan
 
 # ===============================================================================================
-# 라우트 / WebSocket
+# 라우터 엔드포인트
 # ===============================================================================================
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -854,6 +1075,97 @@ async def t30trend(request: Request):
 async def bbtrend30(request: Request):
     return templates.TemplateResponse("trendbb30.html", {"request": request, "markets": krw_markets})
 
+@app.post("/api/bb-patterns/force-update")
+async def force_bb_patterns_update():
+    asyncio.create_task(run_market_pattern_collector_once())
+    return {
+        "status": "triggered",
+        "message": "백그라운드에서 전체 코인 강제 재계산이 시작되었습니다."
+    }
+
+@app.get("/api/bb-patterns")
+async def get_bb_patterns(limit: int = 150, min_score: int = None, only_recommended: bool = False):
+    if bb_pattern_cache["status"] == "initial":
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "processing",
+                "message": "서버 시작 후 최초 수집 작업이 진행 중입니다. 잠시 후 다시 호출해 주세요."
+            }
+        )
+
+    data = bb_pattern_cache["data"]
+    if only_recommended:
+        data = [item for item in data if item.get("recommendation") is not None]
+
+    if min_score is not None:
+        data = [item for item in data if item["overall_score"] >= min_score]
+
+    result_data = data[:limit] if limit is not None else data
+
+    return {
+        "status": bb_pattern_cache["status"],
+        "updated": bb_pattern_cache["updated"],
+        "total_analyzed": bb_pattern_cache["total_markets"],
+        "recommended_count": bb_pattern_cache.get("recommended_count", 0),
+        "result_count": len(result_data),
+        "coins": result_data
+    }
+
+@app.get("/bb-patterns", response_class=HTMLResponse)
+async def aiget_bb_patterns(
+    request: Request,
+    limit: Optional[int] = 150,
+    min_score: Optional[int] = None,
+    only_recommended: Optional[str] = "false"
+):
+    if bb_pattern_cache["status"] == "initial":
+        return templates.TemplateResponse(
+            "bb_patterns.html",
+            {
+                "request": request,
+                "status": "initial",
+                "message": "서버 시작 후 최초 수집 작업이 진행 중입니다. 잠시 후 새로고침해 주세요.",
+                "coins": [],
+                "updated": None,
+                "total_analyzed": 0,
+                "recommended_count": 0,
+                "only_recommended": False
+            }
+        )
+
+    is_only_rec = str(only_recommended).strip().lower() in ("true", "1", "t", "y", "yes")
+    data = list(bb_pattern_cache.get("data", []))
+
+    if is_only_rec:
+        data = [
+            item for item in data
+            if item.get("recommendation") is not None and isinstance(item.get("recommendation"), dict)
+        ]
+
+    if min_score is not None:
+        data = [item for item in data if item.get("overall_score", 0) >= min_score]
+
+    coins_to_render = data[:limit] if limit is not None else data
+
+    return templates.TemplateResponse(
+        "bb_patterns.html",
+        {
+            "request": request,
+            "status": bb_pattern_cache.get("status"),
+            "updated": bb_pattern_cache.get("updated"),
+            "total_analyzed": bb_pattern_cache.get("total_markets", 0),
+            "recommended_count": bb_pattern_cache.get("recommended_count", 0),
+            "coins": coins_to_render,
+            "min_score": min_score,
+            "limit": limit,
+            "only_recommended": is_only_rec
+        }
+    )
+
+# ===============================================================================================
+# WebSocket 및 기타 API
+# ===============================================================================================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -964,34 +1276,21 @@ async def get_top30coins():
         if bid30 > 5_000_000:
             result.append(market)
     result.sort(key=lambda m: trade_counts.get(m, 0), reverse=True)
-    top30 = result[:30]
-    return JSONResponse(content={"markets": top30})
+    return JSONResponse(content={"markets": result[:30]})
 
 @app.get("/api/aitrendt30")
 async def get_all_trends():
     return JSONResponse(content=jsonable_encoder(cross_memory))
 
-# ------------------- 다중 타임프레임 조회 & 강제 수집 -------------------
 @app.get("/api/bbtrend30")
 async def api_bbtrend30(tf: str = None):
     if not bbtrend_cache["updated"]:
-        return {
-            "status": "initial",
-            "message": "첫 수집 전입니다. 잠시 후 다시 시도하세요."
-        }
+        return {"status": "initial", "message": "첫 수집 전입니다. 잠시 후 다시 시도하세요."}
     if bbtrend_cache["status"] == "empty" and not bbtrend_cache["timeframes"]:
-        return {
-            "status": "empty",
-            "message": "현재 /api/top30coins 결과가 없거나 캔들 수집 불가.",
-            "updated": bbtrend_cache["updated"]
-        }
+        return {"status": "empty", "message": "현재 /api/top30coins 결과가 없거나 캔들 수집 불가.", "updated": bbtrend_cache["updated"]}
     if tf:
         if tf not in bbtrend_cache["timeframes"]:
-            return {
-                "status": "error",
-                "message": f"지원하지 않는 타임프레임: {tf}",
-                "available": list(bbtrend_cache["timeframes"].keys())
-            }
+            return {"status": "error", "message": f"지원하지 않는 타임프레임: {tf}", "available": list(bbtrend_cache["timeframes"].keys())}
         return {
             "status": bbtrend_cache["status"],
             "updated": bbtrend_cache["updated"],
@@ -1016,633 +1315,6 @@ async def api_bbtrend30_force():
         "markets_used": bbtrend_cache["markets_used"]
     }
 
-# ===============================================================================================
-# 사용자/지갑/예측 관련 기존 엔드포인트
-# ===============================================================================================
-@app.get("/phapp/tradesetup/{uno}")
-async def phapp_tradesetup(uno: int, db: AsyncSession = Depends(get_db)):
-    setups = None
-    try:
-        query = text("SELECT * FROM polarisSets where userNo = :uno and attrib not like :attxx")
-        result = await db.execute(query, {"uno": uno, "attxx": "%XXX%"})
-        rows = result.fetchall()
-        setups = [
-            {
-                "coinName": row[2],
-                "stepAmt": row[3],
-                "tradeType": row[4],
-                "maxAmt": row[5],
-                "useYN": row[6]
-            } for row in rows
-        ]
-        query2 = text("SELECT changeType, currency,unitPrice,inAmt,outAmt,remainAmt,regDate FROM trWallet where userNo = :uno and attrib not like :attxx order by currency ")
-        result2 = await db.execute(query2, {"uno": uno, "attxx": "%XXX%"})
-        rows2 = result2.fetchall()
-        mycoins = [{
-            "changeType": row2[0],
-            "currency": row2[1],
-            "unitPrice": row2[2],
-            "inAmt": row2[3],
-            "outAmt": row2[4],
-            "remainAmt": row2[5],
-            "regDate": row2[6]
-        } for row2 in rows2]
-        cprices = await get_current_prices()
-        return setups, mycoins, cprices
-    except Exception as e:
-        print("Init Error !!", e)
-
-@app.get("/phapp/tradelog/{uno}")
-async def tradelog(uno: int, db: AsyncSession = Depends(get_db)):
-    mycoins = None
-    try:
-        query = text("SELECT changeType, currency,unitPrice,inAmt,outAmt,remainAmt,regDate FROM trWallet where linkNo = (select max(linkNo) from trWallet where userNo = :uno) order by regDate asc")
-        result = await db.execute(query, {"uno": uno})
-        rows = result.fetchall()
-        mycoins = [{
-            "changeType": row[0],
-            "currency": row[1],
-            "unitPrice": row[2],
-            "inAmt": row[3],
-            "outAmt": row[4],
-            "remainAmt": row[5],
-            "regDate": row[6]
-        } for row in rows]
-    except Exception as e:
-        print("Init Error !!", e)
-    return mycoins
-
-@app.get("/phapp/hotcoinlist")
-async def hotcoins(db: AsyncSession = Depends(get_db)):
-    try:
-        query = text("SELECT * FROM orderbookAmt where dateTag = (select max(dateTag) from orderbookAmt)")
-        result = await db.execute(query)
-        rows = result.fetchall()
-        orderbooks = [
-            {
-                "dateTag": row[1],
-                "idxRow": row[2],
-                "coinName": row[3],
-                "bidAmt": row[4],
-                "askAmt": row[5],
-                "totalAmt": row[6],
-                "amtDiff": row[7]
-            }
-            for row in rows
-        ]
-        return orderbooks
-    except Exception as e:
-        print("Get Hotcoins Error !!", e)
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-@app.get("/phapp/mlogin/{phoneno}/{passwd}")
-async def mlogin(phoneno: str, passwd: str, db: AsyncSession = Depends(get_db)):
-    result = None
-    try:
-        query = text("SELECT userNo, userName,setupKey from trUser where userId = :phoneno and userPasswd = PASSWORD(:passwd)")
-        r = await db.execute(query, {"phoneno": phoneno, "passwd": passwd})
-        rows = r.fetchone()
-        if rows is None:
-            return {"error": "No data found for the given data."}
-        result = {"userno": rows[0], "username": rows[1], "setupkey": rows[2]}
-    except:
-        print("mLogin error")
-    finally:
-        return result
-
-@app.get("/rest_add_predict/{dateTag}/{coinName}/{avgUprate}/{avgDownrate}/{currentPrice}/{predictA}/{predictB}/{predictC}/{predictD}/{rateA}/{rateB}/{rateC}/{rateD}/{intv}")
-async def rest_add_predict(request: Request, dateTag: str, coinName: str, avgUprate: float, avgDownrate: float,
-                           currentPrice: float, predictA: float, predictB: float, predictC: float, predictD: float,
-                           rateA: float, rateB: float, rateC: float, rateD: float, intv: str,
-                           db: AsyncSession = Depends(get_db)):
-    result = await rest_predict(dateTag, coinName, avgUprate, avgDownrate, currentPrice,
-                                predictA, predictB, predictC, predictD,
-                                rateA, rateB, rateC, rateD, intv, db)
-    return bool(result)
-
-@app.get("/restaddorderbookamt/{datetag}/{idxrow}/{coinn}/{bidamt}/{askamt}/{totalamt}/{amtdiff}")
-async def restaddorderbookamt(request: Request, datetag: str, idxrow: int, coinn: str, bidamt: int, askamt: int,
-                              totalamt: int, amtdiff: float, db: AsyncSession = Depends(get_db)):
-    try:
-        act = await rest_add_orderbook_amt(datetag, idxrow, coinn, bidamt, askamt, totalamt, amtdiff, db)
-        return JSONResponse({"success": True})
-    except Exception as e:
-        print("Error!!", e)
-        return JSONResponse({"success": False})
-
-@app.get("/restaddtradeamt/{bidamt}/{askamt}")
-async def restaddtradeamt(request: Request, bidamt: int, askamt: int, db: AsyncSession = Depends(get_db)):
-    try:
-        act = await rest_add_trade_amt(bidamt, askamt, db)
-        return JSONResponse({"success": True})
-    except Exception as e:
-        print("Error!!", e)
-        return JSONResponse({"success": False})
-
 @app.get("/privacy")
 async def privacy(request: Request):
     return templates.TemplateResponse("/privacy/privacy.html", {"request": request})
-
-async def rest_add_trade_amt(bidamt, askamt, db):
-    try:
-        query = text("INSERT INTO tradeAmt (bidAmt, askAmt) VALUES (:bidamt, :askamt)")
-        await db.execute(query, {"bidamt": bidamt, "askamt": askamt})
-        await db.commit()
-        return True
-    except Exception as e:
-        print("Error!!", e)
-        return False
-
-async def rest_add_orderbook_amt(datetag, idxrow, coinn, bidamt, askamt, totalamt, amtdiff, db):
-    try:
-        query = text(
-            "INSERT INTO orderbookAmt (dateTag, idxRow, coinName, bidAmt, askAmt, totalAmt, amtDiff) values (:dateTag, :idxRow, :coinName, :bidAmt, :askAmt, :totalAmt, :amtDiff)")
-        await db.execute(query, {
-            "dateTag": datetag, "idxRow": idxrow, "coinName": coinn, "bidAmt": bidamt,
-            "askAmt": askamt, "totalAmt": totalamt, "amtDiff": amtdiff
-        })
-        await db.commit()
-        return True
-    except Exception as e:
-        print("Error!!", e)
-        return False
-
-async def rest_predict(dateTag, coinName, avgUprate, avgDownrate, currentPrice,
-                       predictA, predictB, predictC, predictD,
-                       rateA, rateB, rateC, rateD, intV, db):
-    try:
-        query = text("""
-            INSERT into predictPrice
-            (dateTag,coinName,avgUprate,avgDownrate,currentPrice,
-             predictA,predictB,predictC,predictD,
-             rateA,rateB,rateC,rateD,intV)
-            values (:dateTag,:coinName,:avgUprate,:avgDownrate,:currentPrice,
-                    :predictA,:predictB,:predictC,:predictD,
-                    :rateA,:rateB,:rateC,:rateD,:intv)
-        """)
-        await db.execute(query, {
-            "dateTag": dateTag, "coinName": coinName, "avgUprate": avgUprate,
-            "avgDownrate": avgDownrate, "currentPrice": currentPrice,
-            "predictA": predictA, "predictB": predictB, "predictC": predictC, "predictD": predictD,
-            "rateA": rateA, "rateB": rateB, "rateC": rateC, "rateD": rateD,
-            "intv": intV
-        })
-        await db.commit()
-        return True
-    except Exception as e:
-        print("Error!!", e)
-        return False
-
-@app.post("/api/bb-patterns/force-update")
-async def force_bb_patterns_update():
-    """
-    10분을 기다리지 않고 즉시 전체 코인 지표를 강제 재계산합니다.
-    """
-    asyncio.create_task(run_market_pattern_collector_once())
-    return {
-        "status": "triggered",
-        "message": "백그라운드에서 전체 코인 강제 재계산이 시작되었습니다."
-    }
-
-# ===============================================================================================
-# [추가] 볼린저 밴드 다중 타임프레임 패턴 분석기 설정 & 전역 캐시
-# ===============================================================================================
-# 10분, 30분, 1시간(60), 4시간(240), 일봉(days)
-BB_ANALYSIS_TIMEFRAMES = [
-    {"key": "10m", "type": "minutes", "unit": 10},
-    {"key": "30m", "type": "minutes", "unit": 30},
-    {"key": "1h", "type": "minutes", "unit": 60},
-    {"key": "4h", "type": "minutes", "unit": 240},
-    {"key": "1d", "type": "days", "unit": None},
-]
-
-BB_PATTERN_INTERVAL = 600  # 10분 (600초)
-BB_ANALYSIS_SEMAPHORE_LIMIT = 5  # 업비트 초당 요청 제한(초당 10회) 보호를 위해 동시 요청 5개로 제한
-
-bb_pattern_cache = {
-    "updated": None,
-    "status": "initial",
-    "total_markets": 0,
-    "data": []  # 마켓별 다중 타임프레임 분석 결과 리스트
-}
-_bb_pattern_lock = asyncio.Lock()
-_bb_pattern_collector_started = False
-
-
-# ===============================================================================================
-# [추가] 패턴 분석 전용 비동기 캔들 조회 함수
-# ===============================================================================================
-async def fetch_pattern_candles_async(client: httpx.AsyncClient, market: str, candle_type: str, count: int = 60,
-                                      unit: int = None) -> pd.DataFrame:
-    base_url = "https://api.upbit.com/v1/candles"
-    if candle_type == "days":
-        url = f"{base_url}/days"
-        params = {"market": market, "count": count}
-    else:
-        url = f"{base_url}/minutes/{unit}"
-        params = {"market": market, "count": count}
-
-    try:
-        r = await client.get(url, params=params, timeout=8)
-        if r.status_code == 200:
-            data = r.json()
-            if not data:
-                return pd.DataFrame()
-            df = pd.DataFrame(data).iloc[::-1].reset_index(drop=True)
-            num_cols = ['opening_price', 'high_price', 'low_price', 'trade_price', 'candle_acc_trade_volume']
-            df[num_cols] = df[num_cols].apply(pd.to_numeric, errors='coerce')
-            return df
-    except Exception:
-        pass
-    return pd.DataFrame()
-
-
-# ===============================================================================================
-# [교체] 단일 캔들프레임 고급 동적 패턴 & 보조지표(Volume, RSI Div, ATR RR) 계산 엔진
-# ===============================================================================================
-def analyze_tf_pattern(
-    df: pd.DataFrame,
-    bb_period: int = 20,
-    bb_std: float = 2.0,
-    rsi_period: int = 14,
-    atr_period: int = 14
-) -> dict:
-    if len(df) < max(bb_period, rsi_period, atr_period) + 10:
-        return None
-
-    close = df['trade_price']
-    high = df['high_price']
-    low = df['low_price']
-    vol = df['candle_acc_trade_volume']
-
-    # 1. 볼린저 밴드 계산
-    ma = close.rolling(window=bb_period).mean()
-    std = close.rolling(window=bb_period).std(ddof=0)
-    upper = ma + (std * bb_std)
-    lower = ma - (std * bb_std)
-
-    band_denom = (upper - lower).replace(0, np.nan)
-    pct_b = (close - lower) / band_denom
-    band_width = (upper - lower) / ma.replace(0, np.nan)
-
-    c_now, c_prev = close.iloc[-1], close.iloc[-2]
-    o_now = df['opening_price'].iloc[-1]
-    pb_now = pct_b.iloc[-1]
-    pb_prev = pct_b.iloc[-2]
-    ma_now, ma_prev = ma.iloc[-1], ma.iloc[-2]
-    bw_now = band_width.iloc[-1]
-
-    # 스퀴즈 및 밴드 확장 여부
-    min_bw_20 = band_width.tail(20).min()
-    is_squeeze = (bw_now <= (min_bw_20 * 1.15)) if pd.notna(min_bw_20) else False
-    bw_expanding = (bw_now > band_width.iloc[-2]) if pd.notna(bw_now) else False
-
-    # 2. 거래량 폭증 여부 (직전 20봉 평균 대비 200% 이상)
-    vol_ma20 = vol.rolling(20).mean()
-    curr_vol = vol.iloc[-1]
-    prev_vol_avg = vol_ma20.iloc[-2]
-    volume_ratio = (curr_vol / prev_vol_avg) if prev_vol_avg > 0 else 1.0
-    is_volume_spike = bool(volume_ratio >= 2.0)
-
-    # 3. RSI 계산
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / rsi_period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / rsi_period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-
-    # 4. RSI 약세 다이버전스 감지 (최근 15봉 신고가 트라이 중 RSI 하락)
-    is_bearish_div = False
-    if high.iloc[-1] >= high.tail(15).max() * 0.99:
-        prev_rsi_peak = rsi.tail(15).iloc[:-2].max()
-        if pd.notna(prev_rsi_peak) and (rsi.iloc[-1] < prev_rsi_peak - 3.0):
-            is_bearish_div = True
-
-    # 5. ATR 및 손익비(Risk/Reward Ratio) 산정
-    prev_close_s = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close_s).abs(),
-        (low - prev_close_s).abs()
-    ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1 / atr_period, adjust=False).mean()
-
-    curr_close = close.iloc[-1]
-    curr_upper = upper.iloc[-1]
-    curr_atr = atr.iloc[-1] if pd.notna(atr.iloc[-1]) else 0.0
-
-    expected_profit = max(0.0, curr_upper - curr_close)
-    expected_risk = max(curr_close * 0.005, curr_atr * 1.5)
-    rr_ratio = expected_profit / expected_risk if expected_risk > 0 else 0.0
-
-    # 6. 기본 패턴 및 종합 점수 판별
-    pattern = "횡보 / 방향 탐색"
-    bias = "중립"
-    score = 0
-    signal_status = "HOLD"
-    reasons = []
-
-    if pb_now >= 0.85 and pb_prev >= 0.85 and ma_now > ma_prev:
-        pattern = "상승 밴드 라이딩"
-        bias = "상승 지속"
-        score = 2
-    elif is_squeeze and bw_expanding and (pb_now > 0.8 and pb_prev <= 0.8):
-        pattern = "스퀴즈 후 상단 돌파"
-        bias = "강력 상승 기대"
-        score = 3
-    elif pb_prev >= 1.0 and pb_now < 0.9 and (c_now < o_now):
-        pattern = "상단 저항 피뢰침 이탈"
-        bias = "단기 조정/하락 주의"
-        score = -2
-    elif pb_prev <= 0.1 and pb_now > 0.2 and (c_now > o_now):
-        pattern = "하단 지지 양봉 반등"
-        bias = "기술적 반등 기대"
-        score = 2
-    elif pb_prev < 0.5 and pb_now >= 0.5:
-        pattern = "중심선 상향 돌파"
-        bias = "상승 전환"
-        score = 1
-    elif pb_prev > 0.5 and pb_now <= 0.5:
-        pattern = "중심선 하향 이탈"
-        bias = "하락 전환"
-        score = -1
-    elif pb_now <= 0.15 and pb_prev <= 0.15 and ma_now < ma_prev:
-        pattern = "하락 밴드 라이딩"
-        bias = "하락 추세 지속"
-        score = -3
-
-    # 7. 보조지표 결합 정밀 신호(Signal) 판정
-    if is_squeeze and bw_expanding and (pb_now >= 0.8):
-        if is_volume_spike and not is_bearish_div:
-            signal_status = "STRONG_BUY"
-            reasons.append("스퀴즈 탈출 + 거래량 폭증")
-        elif not is_volume_spike:
-            reasons.append("가짜 돌파 의심 (거래량 부족)")
-    elif pb_prev < 0.5 and pb_now >= 0.5:
-        if not is_bearish_div:
-            if rr_ratio >= 1.5:
-                signal_status = "BUY"
-                reasons.append(f"중심선 돌파 (손익비 {rr_ratio:.2f})")
-            else:
-                reasons.append(f"손익비 미달 ({rr_ratio:.2f} < 1.5)")
-
-    if is_bearish_div and pb_now >= 0.8:
-        signal_status = "WARNING_SELL"
-        reasons.append("RSI 약세 다이버전스 (고점 이탈 주의)")
-
-    candle_ranges = high - low
-    avg_volatility_pct = (candle_ranges / df['opening_price'] * 100).tail(14).mean()
-
-    return {
-        "price": curr_close,
-        "pct_b": round(float(pb_now) * 100, 1) if pd.notna(pb_now) else 50.0,
-        "pattern": pattern,
-        "bias": bias,
-        "score": score,
-        "bandwidth_expanding": bool(bw_expanding),
-        "expected_volatility_pct": round(float(avg_volatility_pct), 2) if pd.notna(avg_volatility_pct) else 0.0,
-        # 신규 보조지표 결과
-        "volume_ratio": round(float(volume_ratio) * 100, 1),
-        "is_vol_spike": is_volume_spike,
-        "is_bearish_div": is_bearish_div,
-        "atr": round(float(curr_atr), 2),
-        "rr_ratio": round(float(rr_ratio), 2),
-        "signal": signal_status,
-        "reason": ", ".join(reasons) if reasons else "특이 패턴 없음"
-    }
-
-
-# ===============================================================================================
-# [교체] 단일 코인 전체 타임프레임 수집 및 추천 평가 파이프라인
-# ===============================================================================================
-async def analyze_single_market(client: httpx.AsyncClient, market: str, sem: asyncio.Semaphore) -> dict:
-    tf_data = {}
-    total_score = 0
-    current_price = 0.0
-
-    for tf in BB_ANALYSIS_TIMEFRAMES:
-        async with sem:
-            df = await fetch_pattern_candles_async(
-                client, market, candle_type=tf["type"], count=60, unit=tf["unit"]
-            )
-            await asyncio.sleep(0.08)
-
-        if not df.empty:
-            if current_price == 0.0:
-                current_price = float(df['trade_price'].iloc[-1])
-            res = analyze_tf_pattern(df)
-            if res:
-                tf_data[tf["key"]] = res
-                weight = 2 if tf["key"] in ("1d", "4h") else 1
-                total_score += res["score"] * weight
-
-    if not tf_data:
-        return None
-
-    # 보조지표 결합 4개 조건 기반 최종 추천 판정
-    recommendation = evaluate_coin_recommendation(market, tf_data)
-
-    return {
-        "market": market,
-        "price": current_price,
-        "overall_score": total_score,
-        "recommendation": recommendation,  # None 이거나 추천 딕셔너리
-        "timeframes": tf_data
-    }
-
-
-# ===============================================================================================
-# [교체] 10분 백그라운드 수집 워커 (우선순위 정렬 반영)
-# ===============================================================================================
-async def run_market_pattern_collector_once():
-    global bb_pattern_cache
-    if not krw_markets:
-        return
-
-    sem = asyncio.Semaphore(BB_ANALYSIS_SEMAPHORE_LIMIT)
-    all_results = []
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        for market in krw_markets:
-            try:
-                res = await analyze_single_market(client, market, sem)
-                if res:
-                    all_results.append(res)
-            except Exception as e:
-                print(f"[bb_pattern] market {market} 분석 실패: {e}")
-
-    # 1순위: 추천 통과 코인(priority_score 기준 내림차순), 2순위: overall_score 내림차순
-        # 방법 A (추천): 종합 점수(overall_score) 높은 순 정렬을 유지하되, 동점일 때 추천 코인 우선
-        all_results.sort(
-            key=lambda x: (
-                x["overall_score"],
-                1 if x.get("recommendation") else 0,
-                x["recommendation"]["priority_score"] if x.get("recommendation") else 0
-            ),
-            reverse=True
-        )
-
-    async with _bb_pattern_lock:
-        bb_pattern_cache = {
-            "updated": _dt.utcnow().isoformat(),
-            "status": "ok",
-            "total_markets": len(all_results),
-            "recommended_count": len([x for x in all_results if x.get("recommendation")]),
-            "data": all_results
-        }
-    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] KRW {len(all_results)}개 코인 분석 완료 (추천 통과: {bb_pattern_cache['recommended_count']}개)")
-
-
-# ===============================================================================================
-# [교체] REST API 엔드포인트 (추천 코인 전용 필터 파라미터 추가)
-# ===============================================================================================
-@app.get("/api/bb-patterns")
-async def get_bb_patterns(limit: int = 150, min_score: int = None, only_recommended: bool = False):
-    """
-    10분마다 계산된 전체 코인의 멀티 타임프레임 및 추천 목록 조회
-    - limit: 반환할 코인 수
-    - min_score: 필터링할 최소 종합 점수
-    - only_recommended: True일 경우 3단계 보조지표 검증을 통과한 추천 코인만 반환
-    """
-    if bb_pattern_cache["status"] == "initial":
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "processing",
-                "message": "서버 시작 후 최초 수집 작업이 진행 중입니다. 잠시 후 다시 호출해 주세요."
-            }
-        )
-
-    data = bb_pattern_cache["data"]
-
-    if only_recommended:
-        data = [item for item in data if item.get("recommendation") is not None]
-
-    if min_score is not None:
-        data = [item for item in data if item["overall_score"] >= min_score]
-
-    result_data = data[:limit] if limit is not None else data
-
-    return {
-        "status": bb_pattern_cache["status"],
-        "updated": bb_pattern_cache["updated"],
-        "total_analyzed": bb_pattern_cache["total_markets"],
-        "recommended_count": bb_pattern_cache.get("recommended_count", 0),
-        "result_count": len(result_data),
-        "coins": result_data
-    }
-
-@app.get("/bb-patterns", response_class=HTMLResponse)
-async def aiget_bb_patterns(
-    request: Request,
-    limit: Optional[int] = 150,
-    min_score: Optional[int] = None,
-    only_recommended: Optional[str] = "false"
-):
-    # 1. 초기 수집 중일 때 대기 화면 표시
-    if bb_pattern_cache["status"] == "initial":
-        return templates.TemplateResponse(
-            "bb_patterns.html",
-            {
-                "request": request,
-                "status": "initial",
-                "message": "서버 시작 후 최초 수집 작업이 진행 중입니다. 잠시 후 새로고침해 주세요.",
-                "coins": [],
-                "updated": None,
-                "total_analyzed": 0,
-                "recommended_count": 0,
-                "only_recommended": False
-            }
-        )
-
-    # 안전한 불리언 파싱
-    is_only_rec = str(only_recommended).strip().lower() in ("true", "1", "t", "y", "yes")
-
-    data = list(bb_pattern_cache.get("data", []))
-
-    # 추천 코인 필터링
-    if is_only_rec:
-        data = [
-            item for item in data
-            if item.get("recommendation") is not None and isinstance(item.get("recommendation"), dict)
-        ]
-
-    # 최소 종합 점수 필터링
-    if min_score is not None:
-        data = [item for item in data if item.get("overall_score", 0) >= min_score]
-
-    coins_to_render = data[:limit] if limit is not None else data
-
-    return templates.TemplateResponse(
-        "bb_patterns.html",
-        {
-            "request": request,
-            "status": bb_pattern_cache.get("status"),
-            "updated": bb_pattern_cache.get("updated"),
-            "total_analyzed": bb_pattern_cache.get("total_markets", 0),
-            "recommended_count": bb_pattern_cache.get("recommended_count", 0),
-            "coins": coins_to_render,
-            "min_score": min_score,
-            "limit": limit,
-            "only_recommended": is_only_rec
-        }
-    )
-
-async def bb_pattern_collector_loop():
-    await asyncio.sleep(5)  # 서버 기동 및 마켓 리스트 수신 대기
-
-    # 1. 서버 시작 후 최초 1회 즉시 수집 실행
-    try:
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 서버 기동 후 초기 수집을 시작합니다.")
-        await run_market_pattern_collector_once()
-    except Exception as e:
-        print(f"[bb_pattern_collector_loop Initial Error]: {e}")
-
-    # 2. 다음 10분 정각 스케줄링 무한 루프
-    while True:
-        now = datetime.datetime.now()
-
-        # 다음 10분 단위 계산 (예: 14분 -> 20분, 53분 -> 다음 시간 00분)
-        minute_offset = 10 - (now.minute % 10)
-        target_time = (now + datetime.timedelta(minutes=minute_offset)).replace(
-            second=2, microsecond=0  # 캔들 마감 데이터 반영을 위해 정각 2초 뒤 실행
-        )
-
-        sleep_seconds = (target_time - now).total_seconds()
-
-        print(f"[{now.strftime('%H:%M:%S')}] 다음 수집 예정 시각: {target_time.strftime('%H:%M:%S')} (약 {int(sleep_seconds)}초 대기)")
-        await asyncio.sleep(sleep_seconds)
-
-        try:
-            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 10분 정각 정기 수집을 시작합니다.")
-            await run_market_pattern_collector_once()
-        except Exception as e:
-            print(f"[bb_pattern_collector_loop Error]: {e}")
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global krw_markets, _collect_tasks_started, _bb_pattern_collector_started
-    if not _collect_tasks_started:
-        krw_markets = await get_krw_markets()
-        for chunk in chunk_markets(krw_markets, 50):
-            asyncio.create_task(upbit_collector(chunk))
-        asyncio.create_task(reset_trade_counts())
-        asyncio.create_task(trend_loop())
-        start_bb_collector_once()
-
-        # [추가] 10분 주기 전체 코인 패턴 분석기 백그라운드 태스크 등록
-        if not _bb_pattern_collector_started:
-            asyncio.create_task(bb_pattern_collector_loop())
-            _bb_pattern_collector_started = True
-
-        _collect_tasks_started = True
-    yield
-
-
-app.router.lifespan_context = lifespan
-# ===============================================================================================
-# END
-# ===============================================================================================

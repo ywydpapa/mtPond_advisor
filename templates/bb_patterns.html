@@ -91,6 +91,14 @@
 
         tr:hover { background-color: rgba(255, 255, 255, 0.03); }
 
+        /* 거래량 정체 코인 행 스타일 */
+        tr.row-cold {
+            opacity: 0.55;
+        }
+        tr.row-cold:hover {
+            opacity: 0.9;
+        }
+
         .market-badge {
             font-weight: 700;
             color: #38bdf8;
@@ -111,16 +119,6 @@
             vertical-align: middle;
         }
 
-        .recommend-tag {
-            background-color: rgba(239, 68, 68, 0.2);
-            border: 1px solid #ef4444;
-            color: #fca5a5;
-            font-size: 0.72rem;
-            font-weight: 700;
-            padding: 1px 6px;
-            border-radius: 4px;
-        }
-
         .score-pill {
             display: inline-block;
             font-weight: 700;
@@ -131,6 +129,24 @@
         .score-high { background-color: rgba(239, 68, 68, 0.2); color: #f87171; }
         .score-mid { background-color: rgba(100, 116, 139, 0.2); color: #cbd5e1; }
         .score-low { background-color: rgba(59, 130, 246, 0.2); color: #60a5fa; }
+
+        /* 체결 건수 전용 박스 스타일 */
+        .trade-count-box {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            align-items: center;
+        }
+        .count-badge {
+            display: inline-block;
+            font-weight: 700;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+        }
+        .badge-hot { background-color: rgba(16, 185, 129, 0.2); color: #34d399; }
+        .badge-normal { background-color: rgba(251, 191, 36, 0.2); color: #fbbf24; }
+        .badge-cold { background-color: rgba(239, 68, 68, 0.15); color: #f87171; }
 
         .rec-info-box {
             display: flex;
@@ -202,7 +218,7 @@
         <div style="text-align: center; padding: 60px 0; background: var(--card-bg); border-radius: 8px; border: 1px solid var(--border-color);">
             <p style="font-size: 1.05rem; color: #94a3b8;">
                 {% if only_recommended %}
-                    현재 시점에 3단계 보조지표(거래량 폭증 + RSI 다이버전스 배제 + 손익비 1:1.5) 조건을 통과한 추천 코인이 없습니다.
+                    현재 시점에 추천 조건을 통과한 코인이 없습니다.
                 {% else %}
                     표시할 코인 데이터가 없습니다.
                 {% endif %}
@@ -215,6 +231,7 @@
                     <tr>
                         <th style="text-align: left;">마켓</th>
                         <th>현재가</th>
+                        <th>체결 활동도 (10m / 1h)</th>
                         <th>종합 점수</th>
                         <th>진단 / 추천 요약</th>
                         <th>10분봉 (10m)</th>
@@ -227,13 +244,15 @@
                 <tbody>
                     {% for coin in coins %}
                     {% set rec = coin.recommendation %}
-                    <tr>
+                    {% set act = coin.trade_activity %}
+                    <tr class="{% if act and act.activity_level == 'cold' %}row-cold{% endif %}">
                         <td class="market-badge">
                             <a href="https://upbit.com/exchange?code=CRIX.UPBIT.{{ coin.market }}" target="_blank" style="color: #38bdf8; text-decoration: none;">
-                                {{ coin.market }} </a>
-                        {% if rec %}
-                            <span class="recommend-tag">🔥 {{ rec.recommend_type }}</span>
-                        {% endif %}
+                                {{ coin.market }}
+                            </a>
+                            {% if rec %}
+                                <span class="recommend-tag">🔥 {{ rec.recommend_type }}</span>
+                            {% endif %}
                         </td>
                         <td style="text-align: right; font-weight: 600;">
                             {% if coin.price >= 100 %}
@@ -244,6 +263,32 @@
                                 {{ "{:,.4f}".format(coin.price) }}원
                             {% endif %}
                         </td>
+
+                        {# 체결 활동도 컬럼 #}
+                        <td>
+                            {% if act %}
+                                <div class="trade-count-box">
+                                    <div>
+                                        <span class="count-badge {% if act.activity_level == 'hot' %}badge-hot{% elif act.activity_level == 'normal' %}badge-normal{% else %}badge-cold{% endif %}">
+                                            10분: {{ act.trade_count_10m }}건
+                                        </span>
+                                    </div>
+                                    <div style="font-size: 0.73rem; color: var(--text-sub);">
+                                        1시간 {{ act.trade_count_1h }}건
+                                        {% if act.last_trade_sec < 60 %}
+                                            · {{ act.last_trade_sec }}초 전
+                                        {% elif act.last_trade_sec < 3600 %}
+                                            · {{ (act.last_trade_sec // 60) }}분 전
+                                        {% else %}
+                                            · 정체
+                                        {% endif %}
+                                    </div>
+                                </div>
+                            {% else %}
+                                <span style="color: var(--text-sub);">-</span>
+                            {% endif %}
+                        </td>
+
                         <td>
                             {% set s = coin.overall_score %}
                             <span class="score-pill {% if s >= 4 %}score-high{% elif s <= -2 %}score-low{% else %}score-mid{% endif %}">
