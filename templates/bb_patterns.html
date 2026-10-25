@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="300">
     <title>코인 볼린저밴드 멀티 타임프레임 추세 분석</title>
     <style>
         :root {
@@ -188,7 +189,11 @@
         <div>
             <h2>📊 볼린저밴드 멀티 타임프레임 추세 분석판</h2>
             <div class="meta-text" style="margin-top: 4px;">
-                기준 주기: 10분, 30분, 1시간, 4시간, 1일 | 갱신 주기: 매 10분 정각
+                기준 주기: 10분, 30분, 1시간, 4시간, 1일 | 캔들 분석 갱신: 매 10분 정각
+            </div>
+            <div class="meta-text" style="margin-top: 4px;">
+                체결 급증·방향 점수는 확정 5분 구간 기준이며, 이 화면은 5분마다 새로고침됩니다.
+                급증은 직전 최대 20개 구간 평균의 2배 이상, 상승/하락 점수는 보정 전 지표(실제 확률 아님)입니다.
             </div>
         </div>
         <div style="display: flex; align-items: center; gap: 14px;">
@@ -232,6 +237,7 @@
                         <th style="text-align: left;">마켓</th>
                         <th>현재가</th>
                         <th>체결 활동도 (10m / 1h)</th>
+                        <th>매수/매도 급증 · 방향 점수*</th>
                         <th>종합 점수</th>
                         <th>진단 / 추천 요약</th>
                         <th>10분봉 (10m)</th>
@@ -245,6 +251,7 @@
                     {% for coin in coins %}
                     {% set rec = coin.recommendation %}
                     {% set act = coin.trade_activity %}
+                    {% set flow = coin.order_flow %}
                     <tr class="{% if act and act.activity_level == 'cold' %}row-cold{% endif %}">
                         <td class="market-badge">
                             <a href="https://upbit.com/exchange?code=CRIX.UPBIT.{{ coin.market }}" target="_blank" style="color: #38bdf8; text-decoration: none;">
@@ -286,6 +293,39 @@
                                 </div>
                             {% else %}
                                 <span style="color: var(--text-sub);">-</span>
+                            {% endif %}
+                        </td>
+
+                        <td>
+                            {% if flow and flow.up_score is not none %}
+                                <div>
+                                    {% if flow.buy_volume_ratio is none %}
+                                        <span style="color: var(--text-sub);">매수 기준 부족</span>
+                                    {% elif flow.buy_spike %}
+                                        <span style="color: #4ade80; font-weight: 700;">매수 급증 {{ flow.buy_volume_ratio }}배</span>
+                                    {% else %}
+                                        <span style="color: var(--text-sub);">매수 보통</span>
+                                    {% endif %}
+                                    <span style="color: var(--text-sub);">· {{ "{:,.0f}".format(flow.buy_amount_krw) }}원</span>
+                                </div>
+                                <div>
+                                    {% if flow.sell_volume_ratio is none %}
+                                        <span style="color: var(--text-sub);">매도 기준 부족</span>
+                                    {% elif flow.sell_spike %}
+                                        <span style="color: #f87171; font-weight: 700;">매도 급증 {{ flow.sell_volume_ratio }}배</span>
+                                    {% else %}
+                                        <span style="color: var(--text-sub);">매도 보통</span>
+                                    {% endif %}
+                                    <span style="color: var(--text-sub);">· {{ "{:,.0f}".format(flow.sell_amount_krw) }}원</span>
+                                </div>
+                                <div class="tf-detail">
+                                    상승 {{ flow.up_score }}% / 하락 {{ flow.down_score }}%
+                                    (기준 {{ flow.baseline_buckets }}구간)
+                                </div>
+                            {% else %}
+                                <span style="color: var(--text-sub);">
+                                    체결 기준 수집 중 ({{ flow.baseline_buckets if flow else 0 }}/3)
+                                </span>
                             {% endif %}
                         </td>
 

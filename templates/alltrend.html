@@ -11,6 +11,7 @@
 <body>
 <div class="container-fluid mt-5">
     <h2 class="mb-4">Upbit 코인 실시간 체결금액 모니터링</h2>
+    <p class="text-muted">최근 확정된 5분 매수·매도 체결대금이 직전 최대 20개 구간 평균의 2배 이상이면 급증으로 표시합니다(최소 3개 기준 구간 필요). 상승/하락 점수는 보정 전 체결 흐름 지표이며 실제 적중 확률이 아닙니다.</p>
     <table class="table table-striped table-bordered align-middle text-center" id="trade-table">
         <thead class="table-light">
             <tr style="text-align: center;">
@@ -28,6 +29,8 @@
                 <th class="text-center">RATE(30) %</th>
                 <th class="text-center">RATE(120) %</th>
                 <th class="text-center">RATE(240) %</th>
+                <th class="text-center">5분 매수/매도 급증</th>
+                <th class="text-center">상승/하락 점수*</th>
             </tr>
         </thead>
         <tbody>
@@ -47,6 +50,8 @@
                 <td id="{{ market }}-RATIO30">0</td>
                 <td id="{{ market }}-RATIO120">0</td>
                 <td id="{{ market }}-RATIO240">0</td>
+                <td>-</td>
+                <td>-</td>
             </tr>
         {% endfor %}
         </tbody>
@@ -120,6 +125,32 @@
             },
             "type": "num",
             "className": "text-end"
+        },
+        {
+            "targets": [14,15],
+            "render": function (data, type, row) {
+                if (!data || typeof data !== 'object') return data || '-';
+                if (type === 'sort' || type === 'type') return data.up_score ?? 0;
+                if (type !== 'display') return data;
+                if (data.baseline_buckets < 3 || data.up_score === null) {
+                    return `<span class="text-muted">기준 데이터 수집 중 (${data.baseline_buckets}/3)</span>`;
+                }
+                if (data.type === 'volume') {
+                    const buyAmount = Number(data.buy_amount_krw).toLocaleString();
+                    const sellAmount = Number(data.sell_amount_krw).toLocaleString();
+                    const buy = data.buy_volume_ratio === null ? '매수 기준 부족' :
+                        data.buy_spike ? `<span class="text-success fw-bold">매수 급증 (${data.buy_volume_ratio}x)</span>` : '매수 보통';
+                    const sell = data.sell_volume_ratio === null ? '매도 기준 부족' :
+                        data.sell_spike ? `<span class="text-danger fw-bold">매도 급증 (${data.sell_volume_ratio}x)</span>` : '매도 보통';
+                    return `${buy} · ${buyAmount}원<br>${sell} · ${sellAmount}원`;
+                }
+                const direction = data.direction === 'up' ? '상승 우세' :
+                    data.direction === 'down' ? '하락 우세' : '중립';
+                const color = data.direction === 'up' ? 'text-success' :
+                    data.direction === 'down' ? 'text-danger' : 'text-muted';
+                return `<span class="${color}">${direction}<br>${data.up_score}% / ${data.down_score}%</span>`;
+            },
+            "className": "text-center"
         }
     ]
 });
@@ -150,6 +181,8 @@ ws.onmessage = function(event) {
             table.cell(rowIdx[0], 11).data(row.ratio30);
             table.cell(rowIdx[0], 12).data(row.ratio120);
             table.cell(rowIdx[0], 13).data(row.ratio240);
+            table.cell(rowIdx[0], 14).data({ ...row.order_flow, type: 'volume' });
+            table.cell(rowIdx[0], 15).data(row.order_flow);
         }
     });
     table.draw(false);

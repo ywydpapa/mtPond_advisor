@@ -41,6 +41,9 @@ templates = Jinja2Templates(directory="templates")
 # -------------------- 전역 상태 --------------------
 trade_queues = defaultdict(lambda: {'BID': deque(maxlen=240), 'ASK': deque(maxlen=240)})
 trade_counts = defaultdict(int)
+trade_flow_buckets = defaultdict(lambda: deque(maxlen=21))
+ORDER_FLOW_BUCKET_MS = 5 * 60 * 1000
+ORDER_FLOW_BASELINE_BUCKETS = 3
 krw_markets: List[str] = []
 _collect_tasks_started = False
 
@@ -139,10 +142,77 @@ async def upbit_collector(markets_chunk: List[str]):
                     amount = volume * price
                     trade_queues[market][side].append(amount)
                     trade_counts[market] += 1
+                    timestamp_ms = int(trade.get('timestamp') or time.time() * 1000)
+                    record_trade_flow(market, side, amount, timestamp_ms)
         except asyncio.CancelledError:
             raise
         except Exception:
             await asyncio.sleep(1.0)
+
+def _advance_trade_flow_buckets(market: str, current_bucket: int):
+    buckets = trade_flow_buckets[market]
+    if not buckets:
+        buckets.append({"bucket": current_bucket, "BID": 0.0, "ASK": 0.0})
+        return
+
+    last_bucket = buckets[-1]["bucket"]
+    if current_bucket > last_bucket:
+        first_bucket = max(last_bucket + 1, current_bucket - 20)
+        for bucket_id in range(first_bucket, current_bucket + 1):
+            buckets.append({"bucket": bucket_id, "BID": 0.0, "ASK": 0.0})
+
+def record_trade_flow(market: str, side: str, amount: float, timestamp_ms: int):
+    bucket_id = timestamp_ms // ORDER_FLOW_BUCKET_MS
+    _advance_trade_flow_buckets(market, bucket_id)
+
+    for bucket in trade_flow_buckets[market]:
+        if bucket["bucket"] == bucket_id:
+            bucket[side] += amount
+            break
+
+def calculate_order_flow_signal(market: str, now_ms: Optional[int] = None) -> dict:
+    current_bucket = (now_ms if now_ms is not None else int(time.time() * 1000)) // ORDER_FLOW_BUCKET_MS
+    _advance_trade_flow_buckets(market, current_bucket)
+    buckets = list(trade_flow_buckets[market])
+    latest_closed_id = current_bucket - 1
+    current = next((bucket for bucket in buckets if bucket["bucket"] == latest_closed_id), None)
+    baseline = [bucket for bucket in buckets if bucket["bucket"] < latest_closed_id][-20:]
+
+    result = {
+        "buy_amount_krw": round(current["BID"], 0) if current else 0,
+        "sell_amount_krw": round(current["ASK"], 0) if current else 0,
+        "buy_volume_ratio": None,
+        "sell_volume_ratio": None,
+        "buy_spike": False,
+        "sell_spike": False,
+        "up_score": None,
+        "down_score": None,
+        "direction": "insufficient_data",
+        "baseline_buckets": len(baseline),
+    }
+    if current is None or len(baseline) < ORDER_FLOW_BASELINE_BUCKETS:
+        return result
+
+    avg_buy = sum(bucket["BID"] for bucket in baseline) / len(baseline)
+    avg_sell = sum(bucket["ASK"] for bucket in baseline) / len(baseline)
+    buy_ratio = current["BID"] / avg_buy if avg_buy > 0 else None
+    sell_ratio = current["ASK"] / avg_sell if avg_sell > 0 else None
+    result["buy_volume_ratio"] = round(buy_ratio, 2) if buy_ratio is not None else None
+    result["sell_volume_ratio"] = round(sell_ratio, 2) if sell_ratio is not None else None
+    result["buy_spike"] = buy_ratio is not None and buy_ratio >= 2.0
+    result["sell_spike"] = sell_ratio is not None and sell_ratio >= 2.0
+
+    total_amount = current["BID"] + current["ASK"]
+    flow_balance = (current["BID"] - current["ASK"]) / total_amount if total_amount > 0 else 0.0
+    comparable_buy_ratio = min(buy_ratio if buy_ratio is not None else 1.0, 4.0)
+    comparable_sell_ratio = min(sell_ratio if sell_ratio is not None else 1.0, 4.0)
+    ratio_total = comparable_buy_ratio + comparable_sell_ratio
+    ratio_balance = (comparable_buy_ratio - comparable_sell_ratio) / ratio_total if ratio_total else 0.0
+    up_score = round(max(0.0, min(100.0, 50.0 + 50.0 * (0.7 * flow_balance + 0.3 * ratio_balance))), 1)
+    result["up_score"] = up_score
+    result["down_score"] = round(100.0 - up_score, 1)
+    result["direction"] = "up" if up_score >= 55 else "down" if up_score <= 45 else "neutral"
+    return result
 
 async def reset_trade_counts():
     while True:
@@ -968,6 +1038,7 @@ async def analyze_single_market(client: httpx.AsyncClient, market: str, sem: asy
         "price": current_price,
         "overall_score": total_score,
         "trade_activity": trade_activity,
+        "order_flow": calculate_order_flow_signal(market),
         "recommendation": recommendation,
         "timeframes": tf_data
     }
@@ -1120,6 +1191,8 @@ async def get_bb_patterns(
         ]
 
     result_data = data[:limit] if limit is not None else data
+    for item in result_data:
+        item["order_flow"] = calculate_order_flow_signal(item["market"])
 
     return {
         "status": bb_pattern_cache.get("status"),
@@ -1166,6 +1239,8 @@ async def aiget_bb_patterns(
         data = [item for item in data if item.get("overall_score", 0) >= min_score]
 
     coins_to_render = data[:limit] if limit is not None else data
+    for item in coins_to_render:
+        item["order_flow"] = calculate_order_flow_signal(item["market"])
 
     return templates.TemplateResponse(
         "bb_patterns.html",
@@ -1211,6 +1286,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 row = {
                     "market": market,
                     "speed": speed,
+                    "order_flow": calculate_order_flow_signal(market),
                     "bid10": bid10,
                     "ask10": ask10,
                     "bid30": bid30,
@@ -1261,6 +1337,7 @@ async def websocket_top30trend(websocket: WebSocket):
                     result.append({
                         "market": market,
                         "speed": speed,
+                        "order_flow": calculate_order_flow_signal(market),
                         "bid10": bid10,
                         "ask10": ask10,
                         "bid30": bid30,
