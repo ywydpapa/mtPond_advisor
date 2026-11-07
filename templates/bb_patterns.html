@@ -346,6 +346,11 @@
                                     <span style="color: #94a3b8;">
                                         거래량 {{ rec.volume_surge }} | 손익비 {{ rec.rr_ratio }}
                                     </span>
+                                    {% if rec.stop_loss_pct %}
+                                    <span style="color: #fbbf24; font-size: 0.82rem; font-weight: 600;">
+                                        손절가: {{ "{:,.2f}".format(rec.stop_loss_price) if rec.stop_loss_price < 100 else "{:,.0f}".format(rec.stop_loss_price) }}원 ({{ rec.stop_loss_pct }})
+                                    </span>
+                                    {% endif %}
                                 </div>
                             {% else %}
                                 <span style="color: var(--text-sub);">-</span>

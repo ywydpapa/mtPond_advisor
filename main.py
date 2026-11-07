@@ -226,6 +226,22 @@ async def reset_trade_counts():
         for market in list(trade_counts.keys()):
             trade_counts[market] = 0
 
+def get_top30_markets_internal(fallback_to_krw: bool = True) -> List[str]:
+    """메모리(trade_queues, trade_counts)에서 최근 30분 매수대금 및 체결속도 기준 상위 30개 마켓을 직접 추출"""
+    result = []
+    for market in krw_markets:
+        market_data = trade_queues.get(market)
+        if not market_data:
+            continue
+        bid30 = round(sum(list(market_data['BID'])[-30:]), 0)
+        if bid30 > 5_000_000:
+            result.append(market)
+    result.sort(key=lambda m: trade_counts.get(m, 0), reverse=True)
+    top_markets = result[:30]
+    if not top_markets and fallback_to_krw and krw_markets:
+        return krw_markets[:30]
+    return top_markets
+
 # ===============================================================================================
 # 보조 지표 계산 함수
 # ===============================================================================================
@@ -326,17 +342,29 @@ def calculate_advanced_signals(df: pd.DataFrame, bb_period: int = 20, bb_std: fl
     }
 
 async def fetch_top30_from_api(max_retry: int = 3, retry_delay: float = 1.0) -> list:
-    for attempt in range(max_retry):
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                r = await client.get(TOP30_ENDPOINT)
-                if r.status_code == 200:
-                    data = r.json()
-                    return data.get("markets", [])
-        except Exception as e:
-            print(f"[fetch_top30_from_api] attempt={attempt+1} error={e}")
-        await asyncio.sleep(retry_delay)
-    return []
+    # 1. 내부 인메모리 최신 집계 활용 (자가 순환참조 방지 및 즉시 응답)
+    internal_top = get_top30_markets_internal(fallback_to_krw=False)
+    if internal_top:
+        return internal_top
+
+    # 2. 인메모리 데이터가 미축적된 초기 상태이고, 별도 외부 엔드포인트가 지정된 경우에만 외부 호출 시도
+    is_loopback = any(h in (TOP30_ENDPOINT or "") for h in ("becog.iptime.org", "hitoff.iptime.org", "localhost", "127.0.0.1"))
+    if TOP30_ENDPOINT and not is_loopback:
+        for attempt in range(max_retry):
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    r = await client.get(TOP30_ENDPOINT)
+                    if r.status_code == 200:
+                        data = r.json()
+                        markets = data.get("markets", [])
+                        if markets:
+                            return markets
+            except Exception as e:
+                print(f"[fetch_top30_from_api] attempt={attempt+1} error={e}")
+            await asyncio.sleep(retry_delay)
+
+    # 3. 폴백: 기본 KRW 마켓 상위 30개
+    return krw_markets[:30] if krw_markets else []
 
 async def fetch_candles_async(client: httpx.AsyncClient, market: str, unit: int, count: int) -> pd.DataFrame:
     url = f"https://api.upbit.com/v1/candles/minutes/{unit}"
@@ -362,7 +390,12 @@ async def fetch_candles_async(client: httpx.AsyncClient, market: str, unit: int,
     df.set_index("dt", inplace=True)
     return df
 
-def evaluate_coin_recommendation(market: str, tf_results: dict) -> dict:
+def evaluate_coin_recommendation(
+    market: str,
+    tf_results: dict,
+    trade_activity: Optional[dict] = None,
+    order_flow: Optional[dict] = None
+) -> Optional[dict]:
     daily = tf_results.get("1d")
     h4 = tf_results.get("4h")
     m30 = tf_results.get("30m")
@@ -371,28 +404,66 @@ def evaluate_coin_recommendation(market: str, tf_results: dict) -> dict:
     if not (daily and h4 and m30 and m10):
         return None
 
-    if daily["pct_b"] < 40.0 and h4["pct_b"] < 40.0:
+    # [안전장치 1: 역배열 침체장 필터]
+    if daily.get("pct_b", 50.0) < 40.0 and h4.get("pct_b", 50.0) < 40.0:
         return None
 
-    if m10["is_bearish_div"] or m30["is_bearish_div"]:
+    # [안전장치 2: 최고점 과열(상투) 차단 - 20% 급락 방지 핵심]
+    # 일봉 %B > 105% (볼밴 상단 돌파 과열) 또는 일봉/4H RSI >= 75인 경우 진입 금지
+    daily_rsi = daily.get("rsi", 50.0)
+    h4_rsi = h4.get("rsi", 50.0)
+    if daily.get("pct_b", 50.0) > 105.0 or daily_rsi >= 75.0 or h4_rsi >= 78.0:
         return None
 
-    trigger_tf = m30 if m30["signal"] in ("BUY", "STRONG_BUY") else (m10 if m10["signal"] in ("BUY", "STRONG_BUY") else None)
+    # [안전장치 3: RSI 약세 다이버전스(고점 이탈 조짐) 차단]
+    if m10.get("is_bearish_div") or m30.get("is_bearish_div") or h4.get("is_bearish_div"):
+        return None
+
+    # [안전장치 4: 오더 플로우(실체결) 매도 폭탄 감지 시 탈락]
+    if order_flow:
+        # 매도 스파이크 발생 또는 순체결 방향 하방인 경우 즉시 제외
+        if order_flow.get("sell_spike") is True or order_flow.get("direction") == "down":
+            return None
+        if order_flow.get("down_score") is not None and order_flow["down_score"] >= 60.0:
+            return None
+
+    # [안전장치 5: 유동성 부족 코인(호가 얇아 급락하는 잡코인) 제외]
+    if trade_activity:
+        if trade_activity.get("activity_level") == "cold" or trade_activity.get("trade_count_10m", 0) < 15:
+            return None
+
+    # [진입 트리거 검사: 30분봉 또는 10분봉]
+    trigger_tf = m30 if m30.get("signal") in ("BUY", "STRONG_BUY") else (m10 if m10.get("signal") in ("BUY", "STRONG_BUY") else None)
     if not trigger_tf:
         return None
 
-    if trigger_tf["rr_ratio"] < 1.5:
+    # [안전장치 6: 윗꼬리 피뢰침(설거지 음봉/밀림 캔들) 차단]
+    # 고점 대비 현재가가 3.5% 이상 밀렸다면 윗꼬리 달린 매도세 장악 상태
+    high_p = trigger_tf.get("high", trigger_tf["price"])
+    if high_p > 0 and (high_p - trigger_tf["price"]) / high_p >= 0.035:
         return None
 
-    score = (trigger_tf["volume_ratio"] / 100.0) * 2.0 + trigger_tf["rr_ratio"]
+    # [손익비 필터]
+    if trigger_tf.get("rr_ratio", 0) < 1.5:
+        return None
+
+    # [안전 손절가(Stop-Loss) 자동 계산: ATR 1.5배 또는 최대 -4% 제한]
+    current_price = trigger_tf["price"]
+    atr_val = trigger_tf.get("atr", current_price * 0.02)
+    stop_loss_price = max(current_price * 0.96, current_price - (atr_val * 1.5))
+    stop_loss_pct = round(((stop_loss_price - current_price) / current_price) * 100, 2)
+
+    score = (trigger_tf["volume_ratio"] / 100.0) * 1.5 + trigger_tf["rr_ratio"]
 
     return {
         "market": market,
-        "current_price": trigger_tf["price"],
+        "current_price": current_price,
         "recommend_type": trigger_tf["signal"],
         "trigger_timeframe": "30m" if trigger_tf == m30 else "10m",
         "volume_surge": f"{trigger_tf['volume_ratio']}%",
         "rr_ratio": f"1:{trigger_tf['rr_ratio']}",
+        "stop_loss_price": round(stop_loss_price, 2),
+        "stop_loss_pct": f"{stop_loss_pct}%",
         "reason": trigger_tf["reason"],
         "priority_score": round(score, 2)
     }
@@ -597,22 +668,10 @@ def start_bb_collector_once():
 # ===============================================================================================
 # VWMA 크로스 관련 (trend_loop)
 # ===============================================================================================
-async def get_trendcoins():
-    url = 'http://becog.iptime.org:8088/api/top30coins'
-    def fetch():
-        s = requests.Session()
-        s.trust_env = False
-        return s.get(url, timeout=5, proxies={"http": None, "https": None})
-    loop = asyncio.get_running_loop()
-    try:
-        response = await loop.run_in_executor(None, fetch)
-        response.raise_for_status()
-        data = response.json()
-        coins = data.get('markets', [])
-        return coins if isinstance(coins, list) else []
-    except Exception as e:
-        print(f"get_trendcoins: 요청 실패 {e}")
-        return []
+async def get_trendcoins() -> List[str]:
+    # 내부 인메모리 데이터를 직접 조회하여 순환 네트워크 호출(self-call) 제거
+    coins = get_top30_markets_internal(fallback_to_krw=True)
+    return coins
 
 RL_RE = re.compile(r"group=(\w+); *min=(\d+); *sec=(\d+)")
 
@@ -624,6 +683,30 @@ def parse_remaining_req(header_value: str):
         return None
     group, min_cnt, sec_cnt = m.groups()
     return {"group": group, "min": int(min_cnt), "sec": int(sec_cnt)}
+
+async def polite_get_async(client: httpx.AsyncClient, url: str, max_retry: int = 8, base_sleep: float = 0.12, jitter: float = 0.05):
+    for attempt in range(1, max_retry + 1):
+        resp = await client.get(url, timeout=10.0)
+        rem_header = resp.headers.get("Remaining-Req")
+        rem = parse_remaining_req(rem_header)
+
+        if resp.status_code == 200:
+            if rem and rem["sec"] <= 1:
+                await asyncio.sleep(0.25 + random.uniform(0, 0.05))
+            return resp
+
+        if resp.status_code == 429:
+            ra = resp.headers.get("Retry-After")
+            wait = float(ra) if ra else min(2.0, base_sleep * (2 ** (attempt - 1)) + random.uniform(0, jitter))
+            if rem and rem["sec"] == 0:
+                wait = max(wait, 0.6)
+            print(f"[WARN] 429 too_many_requests attempt={attempt} waiting {wait:.3f}s rem={rem}")
+            await asyncio.sleep(wait)
+            continue
+
+        resp.raise_for_status()
+
+    raise RuntimeError("429 재시도 초과")
 
 def polite_get(url, max_retry=8, base_sleep=0.12, jitter=0.05):
     for attempt in range(1, max_retry+1):
@@ -649,7 +732,7 @@ def polite_get(url, max_retry=8, base_sleep=0.12, jitter=0.05):
 
     raise RuntimeError("429 재시도 초과")
 
-async def peak_trade(ticker='KRW-BTC', short_window=3, long_window=20, count=180, candle_unit='1h'):
+async def peak_trade(ticker='KRW-BTC', short_window=3, long_window=20, count=180, candle_unit='1h', client: Optional[httpx.AsyncClient] = None):
     candle_map = {
         '1d': ('days', ''),
         '4h': ('minutes', 240),
@@ -666,7 +749,11 @@ async def peak_trade(ticker='KRW-BTC', short_window=3, long_window=20, count=180
     api_type, minute = candle_map[candle_unit]
 
     url = f'https://api.upbit.com/v1/candles/days?market={ticker}&count={count}' if api_type == 'days' else f'https://api.upbit.com/v1/candles/minutes/{minute}?market={ticker}&count={count}'
-    resp = polite_get(url)
+    if client is not None:
+        resp = await polite_get_async(client, url)
+    else:
+        async with httpx.AsyncClient(timeout=10.0) as local_client:
+            resp = await polite_get_async(local_client, url)
     try:
         data = resp.json()
     except ValueError:
@@ -747,31 +834,33 @@ async def peak_trade(ticker='KRW-BTC', short_window=3, long_window=20, count=180
     }
 
 async def trend_loop():
-    while True:
-        coins = await get_trendcoins()
-        if not coins:
-            await asyncio.sleep(5)
-            continue
-        for coin in coins:
-            try:
-                await peak_trade(ticker=coin, candle_unit='1m')
-            except Exception as e:
-                print(f"peak_trade 실패({coin}): {e}")
-            await asyncio.sleep(0.5)
-        await asyncio.sleep(15)
+    async with httpx.AsyncClient() as client:
+        while True:
+            coins = await get_trendcoins()
+            if not coins:
+                await asyncio.sleep(5)
+                continue
+            for coin in coins:
+                try:
+                    await peak_trade(ticker=coin, candle_unit='1m', client=client)
+                except Exception as e:
+                    print(f"peak_trade 실패({coin}): {e}")
+                await asyncio.sleep(0.5)
+            await asyncio.sleep(15)
 
 async def get_current_prices():
     server_url = "https://api.upbit.com"
     params = {"quote_currencies": "KRW"}
-    res = requests.get(server_url + "/v1/ticker/all", params=params)
-    data = res.json()
-    result = []
-    for item in data:
-        market = item.get("market")
-        trade_price = item.get("trade_price")
-        if market and trade_price:
-            result.append({"market": market, "trade_price": trade_price})
-    return result
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        res = await client.get(server_url + "/v1/ticker/all", params=params)
+        data = res.json()
+        result = []
+        for item in data:
+            market = item.get("market")
+            trade_price = item.get("trade_price")
+            if market and trade_price:
+                result.append({"market": market, "trade_price": trade_price})
+        return result
 
 # ===============================================================================================
 # 패턴 분석 전역 캐시 & 체결 건수 함수
@@ -990,6 +1079,10 @@ def analyze_tf_pattern(df: pd.DataFrame, bb_period: int = 20, bb_std: float = 2.
 
     return {
         "price": curr_close,
+        "high": float(high.iloc[-1]),
+        "open": float(df['opening_price'].iloc[-1]),
+        "low": float(low.iloc[-1]),
+        "rsi": round(float(rsi.iloc[-1]), 1) if pd.notna(rsi.iloc[-1]) else 50.0,
         "pct_b": round(float(pb_now) * 100, 1) if pd.notna(pb_now) else 50.0,
         "pattern": pattern,
         "bias": bias,
@@ -1029,16 +1122,24 @@ async def analyze_single_market(client: httpx.AsyncClient, market: str, sem: asy
     if not tf_data:
         return None
 
-    recommendation = evaluate_coin_recommendation(market, tf_data)
-    # [체결 활동도 데이터 결합]
+    # [체결 활동도 & 오더 플로우 선행 집계]
     trade_activity = await get_trade_activity(market, client)
+    order_flow = calculate_order_flow_signal(market)
+
+    # [5대 안전 필터링이 적용된 추천 평가]
+    recommendation = evaluate_coin_recommendation(
+        market,
+        tf_data,
+        trade_activity=trade_activity,
+        order_flow=order_flow
+    )
 
     return {
         "market": market,
         "price": current_price,
         "overall_score": total_score,
         "trade_activity": trade_activity,
-        "order_flow": calculate_order_flow_signal(market),
+        "order_flow": order_flow,
         "recommendation": recommendation,
         "timeframes": tf_data
     }
@@ -1144,7 +1245,7 @@ async def t30trend(request: Request):
 
 @app.get("/bbtrend30", response_class=HTMLResponse)
 async def bbtrend30(request: Request):
-    return templates.TemplateResponse("trendbb30.html", {"request": request, "markets": krw_markets})
+    return templates.TemplateResponse("bbtrend30.html", {"request": request, "markets": krw_markets})
 
 @app.post("/api/bb-patterns/force-update")
 async def force_bb_patterns_update():
@@ -1363,16 +1464,10 @@ async def websocket_top30trend(websocket: WebSocket):
 
 @app.get("/api/top30coins")
 async def get_top30coins():
-    result = []
-    for market in krw_markets:
-        market_data = trade_queues.get(market)
-        if not market_data:
-            continue
-        bid30 = round(sum(list(market_data['BID'])[-30:]), 0)
-        if bid30 > 5_000_000:
-            result.append(market)
-    result.sort(key=lambda m: trade_counts.get(m, 0), reverse=True)
-    return JSONResponse(content={"markets": result[:30]})
+    top30 = get_top30_markets_internal(fallback_to_krw=False)
+    if not top30 and krw_markets:
+        top30 = krw_markets[:30]
+    return JSONResponse(content={"markets": top30})
 
 @app.get("/api/aitrendt30")
 async def get_all_trends():
@@ -1411,6 +1506,6 @@ async def api_bbtrend30_force():
         "markets_used": bbtrend_cache["markets_used"]
     }
 
-@app.get("/privacy")
+@app.get("/privacy", response_class=HTMLResponse)
 async def privacy(request: Request):
-    return templates.TemplateResponse("/privacy/privacy.html", {"request": request})
+    return templates.TemplateResponse("privacy.html", {"request": request})

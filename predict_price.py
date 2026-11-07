@@ -1,3 +1,4 @@
+import os
 import asyncio
 import requests
 import pandas as pd
@@ -143,11 +144,27 @@ async def peak_trade(
     # print(f"거래량 기울기: {volume_angle:.2f}")
 
 async def get_trendcoins():
-    url = 'http://hitoff.iptime.org/api/top30coins'
-    response = requests.get(url)
-    data = response.json()
-    coins = data['markets']
-    return coins
+    endpoints = [
+        os.getenv("TOP30_ENDPOINT"),
+        'http://127.0.0.1:8000/api/top30coins',
+        'http://localhost:8088/api/top30coins',
+        'http://becog.iptime.org:8088/api/top30coins',
+        'http://hitoff.iptime.org/api/top30coins'
+    ]
+    for url in endpoints:
+        if not url:
+            continue
+        try:
+            response = requests.get(url, timeout=3)
+            if response.status_code == 200:
+                data = response.json()
+                coins = data.get('markets', [])
+                if coins:
+                    return coins
+        except Exception:
+            continue
+    print("get_trendcoins: 모든 엔드포인트에서 코인 목록 조회 실패, 기본 KRW-BTC 반환")
+    return ['KRW-BTC']
 
 async def main_loop():
     while True:
