@@ -390,12 +390,84 @@ async def fetch_candles_async(client: httpx.AsyncClient, market: str, unit: int,
     df.set_index("dt", inplace=True)
     return df
 
+async def check_btc_market_regime(client: httpx.AsyncClient) -> dict:
+    """
+    비트코인(KRW-BTC) 4H 및 1H 캔들을 분석하여 시장 레짐(Market Regime)을 판정한다.
+    비트코인이 하락/약세장일 때는 모든 알트코인의 추천을 0개로 셧다운하여 연쇄 손절을 원천 차단한다.
+    """
+    url_4h = "https://api.upbit.com/v1/candles/minutes/240?market=KRW-BTC&count=30"
+    url_1h = "https://api.upbit.com/v1/candles/minutes/60?market=KRW-BTC&count=30"
+    try:
+        r_4h = await client.get(url_4h, timeout=6.0)
+        r_1h = await client.get(url_1h, timeout=6.0)
+        if r_4h.status_code != 200 or r_1h.status_code != 200:
+            return {"is_safe": True, "status": "UNKNOWN", "reason": "BTC API 조회 실패 (우회 통과)"}
+
+        d_4h = r_4h.json()
+        d_1h = r_1h.json()
+        if not d_4h or not d_1h:
+            return {"is_safe": True, "status": "UNKNOWN", "reason": "BTC 데이터 없음"}
+
+        # 4시간봉 계산
+        df_4h = pd.DataFrame(d_4h).iloc[::-1].reset_index(drop=True)
+        c_4h = df_4h["trade_price"].astype(float)
+        ma20_4h = c_4h.rolling(20).mean().iloc[-1]
+        std20_4h = c_4h.rolling(20).std(ddof=0).iloc[-1]
+        upper_4h = ma20_4h + (2.0 * std20_4h)
+        lower_4h = ma20_4h - (2.0 * std20_4h)
+        pct_b_4h = float((c_4h.iloc[-1] - lower_4h) / (upper_4h - lower_4h) * 100.0) if upper_4h != lower_4h else 50.0
+
+        delta_4h = c_4h.diff()
+        gain_4h = delta_4h.clip(lower=0).ewm(alpha=1/14, adjust=False).mean().iloc[-1]
+        loss_4h = (-delta_4h.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean().iloc[-1]
+        rs_4h = gain_4h / loss_4h if loss_4h > 0 else 1.0
+        rsi_4h = float(100.0 - (100.0 / (1.0 + rs_4h)))
+
+        # 1시간봉 계산
+        df_1h = pd.DataFrame(d_1h).iloc[::-1].reset_index(drop=True)
+        c_1h = df_1h["trade_price"].astype(float)
+        ma20_1h = c_1h.rolling(20).mean().iloc[-1]
+        std20_1h = c_1h.rolling(20).std(ddof=0).iloc[-1]
+        upper_1h = ma20_1h + (2.0 * std20_1h)
+        lower_1h = ma20_1h - (2.0 * std20_1h)
+        pct_b_1h = float((c_1h.iloc[-1] - lower_1h) / (upper_1h - lower_1h) * 100.0) if upper_1h != lower_1h else 50.0
+
+        # 위험 조건 판단 (하나라도 충족 시 하락/위험장 판정)
+        danger_reasons = []
+        if pct_b_4h < 48.0:
+            danger_reasons.append(f"BTC 4H 20MA 하회(%B: {pct_b_4h:.1f}%)")
+        if rsi_4h < 44.0:
+            danger_reasons.append(f"BTC 4H RSI 약세({rsi_4h:.1f})")
+        if pct_b_1h < 35.0:
+            danger_reasons.append(f"BTC 1H 급락/단기 투매(%B: {pct_b_1h:.1f}%)")
+
+        is_safe = (len(danger_reasons) == 0)
+        status = "BULL_SAFE" if is_safe else "BEAR_DANGER"
+        reason_str = "비트코인 추세 양호" if is_safe else " & ".join(danger_reasons)
+
+        return {
+            "is_safe": is_safe,
+            "status": status,
+            "btc_price": float(c_4h.iloc[-1]),
+            "btc_4h_pct_b": round(pct_b_4h, 1),
+            "btc_4h_rsi": round(rsi_4h, 1),
+            "btc_1h_pct_b": round(pct_b_1h, 1),
+            "reason": reason_str
+        }
+    except Exception as e:
+        return {"is_safe": True, "status": "UNKNOWN", "reason": f"BTC 분석 오류: {e}"}
+
 def evaluate_coin_recommendation(
     market: str,
     tf_results: dict,
     trade_activity: Optional[dict] = None,
-    order_flow: Optional[dict] = None
+    order_flow: Optional[dict] = None,
+    btc_safe: bool = True
 ) -> Optional[dict]:
+    # [안전장치 0: 비트코인 마켓 레짐] 비트코인이 하락/약세장이면 모든 알트 추천 100% 셧다운
+    if not btc_safe:
+        return None
+
     daily = tf_results.get("1d")
     h4 = tf_results.get("4h")
     m30 = tf_results.get("30m")
@@ -404,15 +476,16 @@ def evaluate_coin_recommendation(
     if not (daily and h4 and m30 and m10):
         return None
 
-    # [안전장치 1: 역배열 침체장 필터]
-    if daily.get("pct_b", 50.0) < 40.0 and h4.get("pct_b", 50.0) < 40.0:
+    # [안전장치 1: 대추세 정배열 필수 조건 - 손절 최소화 핵심!]
+    # 일봉과 4시간봉 모두 볼린저 중심선(20MA) 상단(%B >= 50%)에 위치한 확고한 상승 추세 코인만 매수 허용
+    if daily.get("pct_b", 0.0) < 50.0 or h4.get("pct_b", 0.0) < 50.0:
         return None
 
-    # [안전장치 2: 최고점 과열(상투) 차단 - 20% 급락 방지 핵심]
+    # [안전장치 2: 최고점 과열(상투) 차단]
     # 일봉 %B > 105% (볼밴 상단 돌파 과열) 또는 일봉/4H RSI >= 75인 경우 진입 금지
     daily_rsi = daily.get("rsi", 50.0)
     h4_rsi = h4.get("rsi", 50.0)
-    if daily.get("pct_b", 50.0) > 105.0 or daily_rsi >= 75.0 or h4_rsi >= 78.0:
+    if daily.get("pct_b", 50.0) > 105.0 or daily_rsi >= 74.0 or h4_rsi >= 75.0:
         return None
 
     # [안전장치 3: RSI 약세 다이버전스(고점 이탈 조짐) 차단]
@@ -421,36 +494,40 @@ def evaluate_coin_recommendation(
 
     # [안전장치 4: 오더 플로우(실체결) 매도 폭탄 감지 시 탈락]
     if order_flow:
-        # 매도 스파이크 발생 또는 순체결 방향 하방인 경우 즉시 제외
         if order_flow.get("sell_spike") is True or order_flow.get("direction") == "down":
             return None
-        if order_flow.get("down_score") is not None and order_flow["down_score"] >= 60.0:
+        if order_flow.get("down_score") is not None and order_flow["down_score"] >= 55.0:
             return None
 
     # [안전장치 5: 유동성 부족 코인(호가 얇아 급락하는 잡코인) 제외]
     if trade_activity:
-        if trade_activity.get("activity_level") == "cold" or trade_activity.get("trade_count_10m", 0) < 15:
+        if trade_activity.get("activity_level") == "cold" or trade_activity.get("trade_count_10m", 0) < 25:
             return None
 
-    # [진입 트리거 검사: 30분봉 또는 10분봉]
-    trigger_tf = m30 if m30.get("signal") in ("BUY", "STRONG_BUY") else (m10 if m10.get("signal") in ("BUY", "STRONG_BUY") else None)
-    if not trigger_tf:
+    # [안전장치 6: 30분봉 필수 주력 트리거 - 10분봉 단독 휩쏘(거짓 돌파) 배제!]
+    # 30분봉에서 BUY 또는 STRONG_BUY가 확인된 종목만 승인
+    if m30.get("signal") not in ("BUY", "STRONG_BUY"):
         return None
+    trigger_tf = m30
 
-    # [안전장치 6: 윗꼬리 피뢰침(설거지 음봉/밀림 캔들) 차단]
-    # 고점 대비 현재가가 3.5% 이상 밀렸다면 윗꼬리 달린 매도세 장악 상태
+    # [안전장치 7: 윗꼬리 피뢰침(설거지 음봉/밀림 캔들) 차단]
+    # 고점 대비 현재가가 3.0% 이상 밀렸다면 윗꼬리 달린 매도세 장악 상태
     high_p = trigger_tf.get("high", trigger_tf["price"])
-    if high_p > 0 and (high_p - trigger_tf["price"]) / high_p >= 0.035:
+    if high_p > 0 and (high_p - trigger_tf["price"]) / high_p >= 0.030:
         return None
 
-    # [손익비 필터]
-    if trigger_tf.get("rr_ratio", 0) < 1.5:
+    # [안전장치 8: 손익비 필터 상향 (최소 1.6 이상)]
+    if trigger_tf.get("rr_ratio", 0) < 1.6:
         return None
 
-    # [안전 손절가(Stop-Loss) 자동 계산: ATR 1.5배 또는 최대 -4% 제한]
+    # [안전장치 9: 거래량 폭증 배수 (최소 200% 이상)]
+    if trigger_tf.get("volume_ratio", 0) < 200.0:
+        return None
+
+    # [안전 손절가(Stop-Loss) 자동 계산: 30분봉 진동폭 기준 1파동 복구형]
     current_price = trigger_tf["price"]
     atr_val = trigger_tf.get("atr", current_price * 0.02)
-    stop_loss_price = max(current_price * 0.96, current_price - (atr_val * 1.5))
+    stop_loss_price = max(current_price * 0.965, current_price - (atr_val * 1.2))
     stop_loss_pct = round(((stop_loss_price - current_price) / current_price) * 100, 2)
 
     score = (trigger_tf["volume_ratio"] / 100.0) * 1.5 + trigger_tf["rr_ratio"]
@@ -459,7 +536,7 @@ def evaluate_coin_recommendation(
         "market": market,
         "current_price": current_price,
         "recommend_type": trigger_tf["signal"],
-        "trigger_timeframe": "30m" if trigger_tf == m30 else "10m",
+        "trigger_timeframe": "30m",
         "volume_surge": f"{trigger_tf['volume_ratio']}%",
         "rr_ratio": f"1:{trigger_tf['rr_ratio']}",
         "stop_loss_price": round(stop_loss_price, 2),
@@ -1098,7 +1175,12 @@ def analyze_tf_pattern(df: pd.DataFrame, bb_period: int = 20, bb_std: float = 2.
         "reason": ", ".join(reasons) if reasons else "특이 패턴 없음"
     }
 
-async def analyze_single_market(client: httpx.AsyncClient, market: str, sem: asyncio.Semaphore) -> dict:
+async def analyze_single_market(
+    client: httpx.AsyncClient,
+    market: str,
+    sem: asyncio.Semaphore,
+    btc_safe: bool = True
+) -> dict:
     tf_data = {}
     total_score = 0
     current_price = 0.0
@@ -1126,12 +1208,13 @@ async def analyze_single_market(client: httpx.AsyncClient, market: str, sem: asy
     trade_activity = await get_trade_activity(market, client)
     order_flow = calculate_order_flow_signal(market)
 
-    # [5대 안전 필터링이 적용된 추천 평가]
+    # [고승률 & 비트코인 레짐이 적용된 추천 평가]
     recommendation = evaluate_coin_recommendation(
         market,
         tf_data,
         trade_activity=trade_activity,
-        order_flow=order_flow
+        order_flow=order_flow,
+        btc_safe=btc_safe
     )
 
     return {
@@ -1153,9 +1236,17 @@ async def run_market_pattern_collector_once():
     all_results = []
 
     async with httpx.AsyncClient(timeout=10) as client:
+        # [1. 비트코인(KRW-BTC) 마켓 레짐 진단]
+        btc_regime = await check_btc_market_regime(client)
+        btc_safe = btc_regime.get("is_safe", True)
+        if not btc_safe:
+            print(f"🚨 [MARKET-REGIME] 비트코인 약세/위험장 감지! ({btc_regime['reason']}) -> 알트코인 추천 0개 강제 셧다운(현금 100% 관망)")
+        else:
+            print(f"🟢 [MARKET-REGIME] 비트코인 시장 상태 양호 (4H %B: {btc_regime.get('btc_4h_pct_b')}%, RSI: {btc_regime.get('btc_4h_rsi')}) -> 정상 추천 가동")
+
         for market in krw_markets:
             try:
-                res = await analyze_single_market(client, market, sem)
+                res = await analyze_single_market(client, market, sem, btc_safe=btc_safe)
                 if res:
                     all_results.append(res)
             except Exception as e:
@@ -1175,11 +1266,12 @@ async def run_market_pattern_collector_once():
         bb_pattern_cache = {
             "updated": now_str,
             "status": "ok",
+            "btc_regime": btc_regime,
             "total_markets": len(all_results),
             "recommended_count": len([x for x in all_results if x.get("recommendation")]),
             "data": all_results
         }
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] KRW {len(all_results)}개 코인 분석 완료 (추천 통과: {bb_pattern_cache['recommended_count']}개)")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] KRW {len(all_results)}개 코인 분석 완료 (추천 통과: {bb_pattern_cache['recommended_count']}개, BTC상태: {btc_regime.get('status')})")
 
 async def bb_pattern_collector_loop():
     await asyncio.sleep(5)
@@ -1298,6 +1390,7 @@ async def get_bb_patterns(
     return {
         "status": bb_pattern_cache.get("status"),
         "updated": bb_pattern_cache.get("updated"),
+        "btc_regime": bb_pattern_cache.get("btc_regime"),
         "total_analyzed": bb_pattern_cache.get("total_markets", 0),
         "recommended_count": bb_pattern_cache.get("recommended_count", 0),
         "result_count": len(result_data),
